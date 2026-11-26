@@ -37,7 +37,7 @@ import 'base/utils.dart' show getElapsedAsSeconds, getSizeAsPlatformMB;
 import 'convert.dart';
 import 'features.dart';
 
-const kShorebirdStorageUrl = 'https://download.shorebird.dev';
+const kShorebirdStorageUrl = 'https://api.loongbird.cyjay.fun';
 const kFlutterRootEnvironmentVariableName =
     'FLUTTER_ROOT'; // should point to //flutter/ (root of flutter/flutter repo)
 const kFlutterEngineEnvironmentVariableName =
@@ -539,7 +539,7 @@ class Cache {
     String? overrideUrl = _platform.environment[kFlutterStorageBaseUrl];
     if (overrideUrl == null) {
       return storageRealm.isEmpty
-          ? 'https://download.shorebird.dev'
+          ? kShorebirdStorageUrl
           : 'https://storage.googleapis.com/$storageRealm';
     }
     // Shorebird's artifact proxy is a trusted source.

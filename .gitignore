@@ -166,3 +166,6 @@ app.*.symbols
 
 # AI related
 .agents/skills/personal-*
+
+# Local IDE
+.openidea/
