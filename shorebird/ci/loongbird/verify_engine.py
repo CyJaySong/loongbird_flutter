@@ -1066,6 +1066,9 @@ def verify_stage4_desktop_hot_update(
         key_dir = work / "stage4_keys"
         key_dir.mkdir(parents=True, exist_ok=True)
         priv_pem, pub_b64 = generate_rsa_keypair(key_dir)
+        # flutter_tools only compiles `patch_public_key` into the bundled
+        # shorebird.yaml from SHOREBIRD_PUBLIC_KEY (the yaml key is dropped).
+        build_env["SHOREBIRD_PUBLIC_KEY"] = pub_b64
 
         # Create minimal test Flutter desktop app
         app_dir = work / "lb_engine_test"
@@ -1194,6 +1197,13 @@ def verify_stage4_desktop_hot_update(
         ]:
             if token not in out1:
                 raise RuntimeError(f"Run 1 missing expected token '{token}':\n{out1}")
+        # Signing must actually be enabled: patch_public_key only reaches the
+        # bundled shorebird.yaml via SHOREBIRD_PUBLIC_KEY, and a patch that
+        # verifies proves the RSA-2048 PKCS#1 v1.5 SHA-256 signature check ran.
+        if "patch_public_key: None" in out1:
+            raise RuntimeError(f"Run 1 built without patch_public_key:\n{out1}")
+        if "Patch signature is valid" not in out1:
+            raise RuntimeError(f"Run 1 did not report a valid patch signature:\n{out1}")
         if "FATAL err=" in out1:
             raise RuntimeError(f"Run 1 reported error:\n{out1}")
 
