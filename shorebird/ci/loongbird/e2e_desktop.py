@@ -22,6 +22,8 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -191,6 +193,20 @@ Future<Map<String, String>> runAllStressTests() async {
 '''
 
 
+def _kill_process_tree(proc: subprocess.Popen[str]) -> None:
+  if os.name == 'nt':
+    subprocess.run(
+        ['taskkill', '/F', '/T', '/PID', str(proc.pid)],
+        capture_output=True,
+        check=False,
+    )
+  else:
+    try:
+      proc.kill()
+    except OSError:
+      pass
+
+
 def run_cmd(
     cmd: list[str],
     *,
@@ -200,26 +216,54 @@ def run_cmd(
     check: bool = True,
 ) -> subprocess.CompletedProcess[str]:
   print(f'[cmd] ({cwd or Path.cwd()}) {" ".join(cmd)}', flush=True)
-  res = subprocess.run(
+  proc = subprocess.Popen(
       cmd,
       cwd=str(cwd) if cwd else None,
       env=env,
-      capture_output=True,
+      stdout=subprocess.PIPE,
+      stderr=subprocess.STDOUT,
       text=True,
-      timeout=timeout,
-      check=False,
+      encoding='utf-8',
+      errors='replace',
+      bufsize=1,
   )
-  if res.stdout:
-    print(res.stdout, flush=True)
-  if res.stderr:
-    print(res.stderr, file=sys.stderr, flush=True)
-  if check and res.returncode != 0:
-    raise RuntimeError(f'Command failed (rc={res.returncode}): {" ".join(cmd)}')
+  output_chunks: list[str] = []
+
+  def _pump() -> None:
+    assert proc.stdout is not None
+    for line in proc.stdout:
+      output_chunks.append(line)
+      sys.stdout.write(line)
+      sys.stdout.flush()
+
+  reader = threading.Thread(target=_pump, daemon=True)
+  reader.start()
+  try:
+    rc = proc.wait(timeout=timeout)
+  except subprocess.TimeoutExpired:
+    print(f'[cmd] Timed out after {timeout}s; terminating process tree (pid={proc.pid})...', flush=True)
+    _kill_process_tree(proc)
+    reader.join(timeout=5)
+    raise RuntimeError(f'Command timed out after {timeout}s: {" ".join(cmd)}')
+
+  reader.join(timeout=5)
+  combined = ''.join(output_chunks)
+  res = subprocess.CompletedProcess(cmd, rc, stdout=combined, stderr='')
+  if check and rc != 0:
+    raise RuntimeError(f'Command failed (rc={rc}): {" ".join(cmd)}')
   return res
 
 
+# flutter_tools/pubspec.yaml pins the pure-Dart shorebird_build_trace package from
+# github.com/shorebirdtech/shorebird.git; it is NOT a prebuilt binary/engine artifact.
+_ALLOWED_PURE_DART_URLS = {
+    'https://github.com/shorebirdtech/shorebird.git',
+}
+
+
 def assert_no_upstream_shorebird_urls(output: str, label: str) -> None:
-  bad = re.findall(r'https?://[^\s"\']*(?:shorebird\.dev|shorebirdtech)[^\s"\']*', output)
+  found = re.findall(r'https?://[^\s"\']*(?:shorebird\.dev|shorebirdtech)[^\s"\']*', output)
+  bad = [u for u in found if u.rstrip('.,;)') not in _ALLOWED_PURE_DART_URLS]
   if bad:
     raise RuntimeError(f'[{label}] Detected forbidden upstream shorebird URLs: {bad[:5]}')
 
