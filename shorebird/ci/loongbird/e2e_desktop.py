@@ -406,7 +406,7 @@ def main() -> int:
   pubspec_path.write_text(pubspec)
 
   (app_dir / 'shorebird.yaml').write_text(
-      f'app_id: {args.app_id}\nbase_url: {gateway}\nauto_update: true\n'
+      f'app_id: {args.app_id}\nbase_url: {gateway}\nauto_update: false\n'
   )
   (app_dir / 'lib' / 'main.dart').write_text(MAIN_DART)
   (app_dir / 'lib' / 'patch_workload.dart').write_text(PATCH_WORKLOAD_BASE)

@@ -28,6 +28,10 @@ on:
         description: 'Upload built artifacts directly to Loongbird Gateway'
         type: boolean
         default: true
+      skip_existing_builds:
+        description: 'Skip build shards whose output artifacts already exist on the Loongbird Gateway'
+        type: boolean
+        default: true
       allow_413_fallback:
         description: 'Warn instead of failing if CDN returns HTTP 413 on large zips (still saved as GHA artifacts)'
         type: boolean
@@ -64,18 +68,40 @@ jobs:
     timeout-minutes: 180
     name: '🐧 Linux x64 Host Release (Dart SDK + GTK + patch)'
     steps:
-      - name: Free runner disk space
-        run: |
-          df -h
-          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost /usr/local/lib/android /opt/hostedtoolcache/CodeQL
-          df -h
-
       - name: Checkout loongbird_flutter
         uses: actions/checkout@v4
         with:
           fetch-depth: 1
 
+      - name: Check existing artifacts on gateway
+        id: check
+        env:
+          LOONGBIRD_GATEWAY_URL: ${{ inputs.gateway_url }}
+          LOONGBIRD_API_TOKEN: ${{ secrets.LOONGBIRD_API_TOKEN }}
+        run: |
+          ENGINE_REV="$(tr -d '[:space:]' < bin/internal/engine.version)"
+          echo "ENGINE_REV=$ENGINE_REV" >> "$GITHUB_ENV"
+          if [ "${{ inputs.skip_existing_builds }}" = "true" ] && [ -n "$LOONGBIRD_API_TOKEN" ]; then
+            if python3 shorebird/ci/loongbird/upload_artifacts.py \
+              --check-exists "flutter_infra_release/flutter/${ENGINE_REV}/dart-sdk-linux-x64.zip" \
+              --check-exists "flutter_infra_release/flutter/${ENGINE_REV}/linux-x64-release/linux-x64-flutter-gtk.zip" \
+              --check-exists "shorebird/${ENGINE_REV}/patch-linux-x64.zip"; then
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+              echo "All Linux host_release artifacts already exist on gateway; skipping build."
+              exit 0
+            fi
+          fi
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+
+      - name: Free runner disk space
+        if: ${{ steps.check.outputs.skip != 'true' }}
+        run: |
+          df -h
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost /usr/local/lib/android /opt/hostedtoolcache/CodeQL
+          df -h
+
       - name: Install Linux build dependencies & Rust target
+        if: ${{ steps.check.outputs.skip != 'true' }}
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
@@ -83,6 +109,7 @@ jobs:
           rustup target add x86_64-unknown-linux-gnu
 
       - name: Configure git auth & depot_tools
+        if: ${{ steps.check.outputs.skip != 'true' }}
         env:
           LOONGBIRD_DART_SDK_TOKEN: ${{ secrets.LOONGBIRD_DART_SDK_TOKEN }}
         run: |
@@ -94,6 +121,7 @@ jobs:
           echo "$HOME/depot_tools" >> "$GITHUB_PATH"
 
       - name: gclient sync (minimal Linux host deps)
+        if: ${{ steps.check.outputs.skip != 'true' }}
         run: |
           cat > .gclient <<'EOF'
           solutions = [
@@ -117,9 +145,8 @@ jobs:
           gclient sync --no-history --shallow --delete_unversioned_trees
 
       - name: Build Linux host_release (dart_sdk + flutter_gtk) & patch CLI
+        if: ${{ steps.check.outputs.skip != 'true' }}
         run: |
-          ENGINE_REV="$(tr -d '[:space:]' < bin/internal/engine.version)"
-          echo "ENGINE_REV=$ENGINE_REV" >> "$GITHUB_ENV"
           echo "Building for ENGINE_REV=$ENGINE_REV"
 
           cargo build --release --manifest-path engine/src/flutter/third_party/updater/patch/Cargo.toml
@@ -130,16 +157,18 @@ jobs:
             flutter/shell/platform/linux:flutter_gtk
 
       - name: Package & stage Linux host_release artifacts
+        if: ${{ steps.check.outputs.skip != 'true' }}
         run: |
           python3 shorebird/ci/loongbird/upload_artifacts.py \
             --zip-dir "engine/src/out/host_release/dart-sdk=staged_tmp/dart-sdk-linux-x64.zip:dart-sdk" \
-            --zip-file "engine/src/flutter/third_party/updater/patch/target/release/patch=staged_tmp/patch-linux-x64.zip:patch" \
+            --zip-file "engine/src/flutter/third_party/updater/target/release/patch=staged_tmp/patch-linux-x64.zip:patch" \
             --stage-dir staged_artifacts \
             --map "staged_tmp/dart-sdk-linux-x64.zip=flutter_infra_release/flutter/${ENGINE_REV}/dart-sdk-linux-x64.zip" \
             --map "engine/src/out/host_release/zip_archives/linux-x64-release/linux-x64-flutter-gtk.zip=flutter_infra_release/flutter/${ENGINE_REV}/linux-x64-release/linux-x64-flutter-gtk.zip" \
             --map "staged_tmp/patch-linux-x64.zip=shorebird/${ENGINE_REV}/patch-linux-x64.zip"
 
       - name: Upload GitHub Actions artifacts
+        if: ${{ steps.check.outputs.skip != 'true' }}
         uses: actions/upload-artifact@v4
         with:
           name: loongbird-linux-host-release-${{ env.ENGINE_REV }}
@@ -147,7 +176,7 @@ jobs:
           retention-days: 14
 
       - name: Upload to Loongbird Gateway
-        if: ${{ inputs.upload_to_gateway }}
+        if: ${{ steps.check.outputs.skip != 'true' && inputs.upload_to_gateway }}
         env:
           LOONGBIRD_GATEWAY_URL: ${{ inputs.gateway_url }}
           LOONGBIRD_API_TOKEN: ${{ secrets.LOONGBIRD_API_TOKEN }}
@@ -166,16 +195,36 @@ jobs:
     timeout-minutes: 150
     name: '🐧 Linux x64 Host Debug Artifacts'
     steps:
-      - name: Free runner disk space
-        run: |
-          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost /usr/local/lib/android /opt/hostedtoolcache/CodeQL
-
       - name: Checkout loongbird_flutter
         uses: actions/checkout@v4
         with:
           fetch-depth: 1
 
+      - name: Check existing artifacts on gateway
+        id: check
+        env:
+          LOONGBIRD_GATEWAY_URL: ${{ inputs.gateway_url }}
+          LOONGBIRD_API_TOKEN: ${{ secrets.LOONGBIRD_API_TOKEN }}
+        run: |
+          ENGINE_REV="$(tr -d '[:space:]' < bin/internal/engine.version)"
+          echo "ENGINE_REV=$ENGINE_REV" >> "$GITHUB_ENV"
+          if [ "${{ inputs.skip_existing_builds }}" = "true" ] && [ -n "$LOONGBIRD_API_TOKEN" ]; then
+            if python3 shorebird/ci/loongbird/upload_artifacts.py \
+              --check-exists "flutter_infra_release/flutter/${ENGINE_REV}/linux-x64/artifacts.zip"; then
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+              echo "Linux host_debug artifact already exists on gateway; skipping build."
+              exit 0
+            fi
+          fi
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+
+      - name: Free runner disk space
+        if: ${{ steps.check.outputs.skip != 'true' }}
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost /usr/local/lib/android /opt/hostedtoolcache/CodeQL
+
       - name: Install Linux build dependencies & Rust target
+        if: ${{ steps.check.outputs.skip != 'true' }}
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
@@ -183,6 +232,7 @@ jobs:
           rustup target add x86_64-unknown-linux-gnu
 
       - name: Configure git auth & depot_tools
+        if: ${{ steps.check.outputs.skip != 'true' }}
         env:
           LOONGBIRD_DART_SDK_TOKEN: ${{ secrets.LOONGBIRD_DART_SDK_TOKEN }}
         run: |
@@ -194,6 +244,7 @@ jobs:
           echo "$HOME/depot_tools" >> "$GITHUB_PATH"
 
       - name: gclient sync (minimal Linux host deps)
+        if: ${{ steps.check.outputs.skip != 'true' }}
         run: |
           cat > .gclient <<'EOF'
           solutions = [
@@ -217,19 +268,20 @@ jobs:
           gclient sync --no-history --shallow --delete_unversioned_trees
 
       - name: Build Linux host_debug artifacts
+        if: ${{ steps.check.outputs.skip != 'true' }}
         run: |
-          ENGINE_REV="$(tr -d '[:space:]' < bin/internal/engine.version)"
-          echo "ENGINE_REV=$ENGINE_REV" >> "$GITHUB_ENV"
           python3 shorebird/ci/loongbird/run_gn.py
           ninja -C engine/src/out/host_debug flutter/build/archives:artifacts
 
       - name: Stage Linux host_debug artifacts
+        if: ${{ steps.check.outputs.skip != 'true' }}
         run: |
           python3 shorebird/ci/loongbird/upload_artifacts.py \
             --stage-dir staged_artifacts \
             --map "engine/src/out/host_debug/zip_archives/linux-x64/artifacts.zip=flutter_infra_release/flutter/${ENGINE_REV}/linux-x64/artifacts.zip"
 
       - name: Upload GitHub Actions artifacts
+        if: ${{ steps.check.outputs.skip != 'true' }}
         uses: actions/upload-artifact@v4
         with:
           name: loongbird-linux-host-debug-${{ env.ENGINE_REV }}
@@ -237,7 +289,7 @@ jobs:
           retention-days: 14
 
       - name: Upload to Loongbird Gateway
-        if: ${{ inputs.upload_to_gateway }}
+        if: ${{ steps.check.outputs.skip != 'true' && inputs.upload_to_gateway }}
         env:
           LOONGBIRD_GATEWAY_URL: ${{ inputs.gateway_url }}
           LOONGBIRD_API_TOKEN: ${{ secrets.LOONGBIRD_API_TOKEN }}
@@ -272,16 +324,36 @@ jobs:
             archive_subdir: android-x64-release
     name: '🐧 Linux x64 Android ${{ matrix.cpu }} gen_snapshot'
     steps:
-      - name: Free runner disk space
-        run: |
-          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost /usr/local/lib/android /opt/hostedtoolcache/CodeQL
-
       - name: Checkout loongbird_flutter
         uses: actions/checkout@v4
         with:
           fetch-depth: 1
 
+      - name: Check existing artifacts on gateway
+        id: check
+        env:
+          LOONGBIRD_GATEWAY_URL: ${{ inputs.gateway_url }}
+          LOONGBIRD_API_TOKEN: ${{ secrets.LOONGBIRD_API_TOKEN }}
+        run: |
+          ENGINE_REV="$(tr -d '[:space:]' < bin/internal/engine.version)"
+          echo "ENGINE_REV=$ENGINE_REV" >> "$GITHUB_ENV"
+          if [ "${{ inputs.skip_existing_builds }}" = "true" ] && [ -n "$LOONGBIRD_API_TOKEN" ]; then
+            if python3 shorebird/ci/loongbird/upload_artifacts.py \
+              --check-exists "flutter_infra_release/flutter/${ENGINE_REV}/${{ matrix.archive_subdir }}/linux-x64.zip"; then
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+              echo "Linux Android ${{ matrix.cpu }} gen_snapshot already exists on gateway; skipping build."
+              exit 0
+            fi
+          fi
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+
+      - name: Free runner disk space
+        if: ${{ steps.check.outputs.skip != 'true' }}
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost /usr/local/lib/android /opt/hostedtoolcache/CodeQL
+
       - name: Configure git auth & depot_tools
+        if: ${{ steps.check.outputs.skip != 'true' }}
         env:
           LOONGBIRD_DART_SDK_TOKEN: ${{ secrets.LOONGBIRD_DART_SDK_TOKEN }}
         run: |
@@ -293,6 +365,7 @@ jobs:
           echo "$HOME/depot_tools" >> "$GITHUB_PATH"
 
       - name: gclient sync (Android gen_snapshot deps)
+        if: ${{ steps.check.outputs.skip != 'true' }}
         run: |
           cat > .gclient <<'EOF'
           solutions = [
@@ -316,19 +389,20 @@ jobs:
           gclient sync --no-history --shallow --delete_unversioned_trees
 
       - name: Build Android ${{ matrix.cpu }} Linux gen_snapshot
+        if: ${{ steps.check.outputs.skip != 'true' }}
         run: |
-          ENGINE_REV="$(tr -d '[:space:]' < bin/internal/engine.version)"
-          echo "ENGINE_REV=$ENGINE_REV" >> "$GITHUB_ENV"
           python3 shorebird/ci/loongbird/run_gn.py -- --android ${{ matrix.gn_cpu_flag }} --runtime-mode=release
           ninja -C "engine/src/out/${{ matrix.out_dir }}" flutter/shell/platform/android:gen_snapshot
 
       - name: Stage Linux Android gen_snapshot artifact
+        if: ${{ steps.check.outputs.skip != 'true' }}
         run: |
           python3 shorebird/ci/loongbird/upload_artifacts.py \
             --stage-dir staged_artifacts \
             --map "engine/src/out/${{ matrix.out_dir }}/zip_archives/${{ matrix.archive_subdir }}/linux-x64.zip=flutter_infra_release/flutter/${ENGINE_REV}/${{ matrix.archive_subdir }}/linux-x64.zip"
 
       - name: Upload GitHub Actions artifacts
+        if: ${{ steps.check.outputs.skip != 'true' }}
         uses: actions/upload-artifact@v4
         with:
           name: loongbird-linux-android-${{ matrix.cpu }}-${{ env.ENGINE_REV }}
@@ -336,7 +410,7 @@ jobs:
           retention-days: 14
 
       - name: Upload to Loongbird Gateway
-        if: ${{ inputs.upload_to_gateway }}
+        if: ${{ steps.check.outputs.skip != 'true' && inputs.upload_to_gateway }}
         env:
           LOONGBIRD_GATEWAY_URL: ${{ inputs.gateway_url }}
           LOONGBIRD_API_TOKEN: ${{ secrets.LOONGBIRD_API_TOKEN }}
@@ -357,14 +431,7 @@ jobs:
       DEPOT_TOOLS_WIN_TOOLCHAIN: '0'
       GYP_MSVS_VERSION: '2022'
     steps:
-      - name: Free runner disk space
-        shell: pwsh
-        run: |
-          Get-PSDrive -PSProvider FileSystem
-          Remove-Item -Recurse -Force -ErrorAction SilentlyContinue "C:\Android", "C:\ghcup", "C:\hostedtoolcache\windows\CodeQL"
-          Get-PSDrive -PSProvider FileSystem
-
-      - name: Enable git longpaths & checkout loongbird_flutter
+      - name: Enable git longpaths
         shell: pwsh
         run: |
           git config --global core.longpaths true
@@ -375,7 +442,43 @@ jobs:
         with:
           fetch-depth: 1
 
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Check existing artifacts on gateway
+        id: check
+        shell: pwsh
+        env:
+          LOONGBIRD_GATEWAY_URL: ${{ inputs.gateway_url }}
+          LOONGBIRD_API_TOKEN: ${{ secrets.LOONGBIRD_API_TOKEN }}
+        run: |
+          $engineRev = (Get-Content -Raw bin/internal/engine.version).Trim()
+          "ENGINE_REV=$engineRev" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          if ("${{ inputs.skip_existing_builds }}" -eq "true" -and $env:LOONGBIRD_API_TOKEN) {
+            python shorebird/ci/loongbird/upload_artifacts.py `
+              --check-exists "flutter_infra_release/flutter/$engineRev/dart-sdk-windows-x64.zip" `
+              --check-exists "flutter_infra_release/flutter/$engineRev/windows-x64-release/windows-x64-flutter.zip" `
+              --check-exists "shorebird/$engineRev/patch-windows-x64.zip"
+            if ($LASTEXITCODE -eq 0) {
+              "skip=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+              Write-Host "All Windows host_release artifacts already exist on gateway; skipping build."
+              exit 0
+            }
+          }
+          "skip=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+      - name: Free runner disk space
+        if: ${{ steps.check.outputs.skip != 'true' }}
+        shell: pwsh
+        run: |
+          Get-PSDrive -PSProvider FileSystem
+          Remove-Item -Recurse -Force -ErrorAction SilentlyContinue "C:\Android", "C:\ghcup", "C:\hostedtoolcache\windows\CodeQL"
+          Get-PSDrive -PSProvider FileSystem
+
       - name: Configure git auth, Rust target & depot_tools
+        if: ${{ steps.check.outputs.skip != 'true' }}
         shell: pwsh
         env:
           LOONGBIRD_DART_SDK_TOKEN: ${{ secrets.LOONGBIRD_DART_SDK_TOKEN }}
@@ -389,6 +492,7 @@ jobs:
           "C:\depot_tools" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
 
       - name: gclient sync (minimal Windows host deps)
+        if: ${{ steps.check.outputs.skip != 'true' }}
         shell: pwsh
         run: |
           @'
@@ -413,11 +517,10 @@ jobs:
           gclient.bat sync --no-history --shallow --delete_unversioned_trees
 
       - name: Build Windows host_release (dart_sdk + windows_flutter) & patch.exe
+        if: ${{ steps.check.outputs.skip != 'true' }}
         shell: pwsh
         run: |
-          $engineRev = (Get-Content -Raw bin/internal/engine.version).Trim()
-          "ENGINE_REV=$engineRev" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          Write-Host "Building Windows host_release for ENGINE_REV=$engineRev"
+          Write-Host "Building Windows host_release for ENGINE_REV=$env:ENGINE_REV"
 
           cargo build --release --manifest-path engine/src/flutter/third_party/updater/patch/Cargo.toml
 
@@ -427,17 +530,19 @@ jobs:
             flutter/build/archives:windows_flutter
 
       - name: Package & stage Windows host_release artifacts
+        if: ${{ steps.check.outputs.skip != 'true' }}
         shell: pwsh
         run: |
           python3 shorebird/ci/loongbird/upload_artifacts.py `
             --zip-dir "engine/src/out/host_release/dart-sdk=staged_tmp/dart-sdk-windows-x64.zip:dart-sdk" `
-            --zip-file "engine/src/flutter/third_party/updater/patch/target/release/patch.exe=staged_tmp/patch-windows-x64.zip:patch.exe" `
+            --zip-file "engine/src/flutter/third_party/updater/target/release/patch.exe=staged_tmp/patch-windows-x64.zip:patch.exe" `
             --stage-dir staged_artifacts `
             --map "staged_tmp/dart-sdk-windows-x64.zip=flutter_infra_release/flutter/$env:ENGINE_REV/dart-sdk-windows-x64.zip" `
             --map "engine/src/out/host_release/zip_archives/windows-x64-release/windows-x64-flutter.zip=flutter_infra_release/flutter/$env:ENGINE_REV/windows-x64-release/windows-x64-flutter.zip" `
             --map "staged_tmp/patch-windows-x64.zip=shorebird/$env:ENGINE_REV/patch-windows-x64.zip"
 
       - name: Upload GitHub Actions artifacts
+        if: ${{ steps.check.outputs.skip != 'true' }}
         uses: actions/upload-artifact@v4
         with:
           name: loongbird-windows-host-release-${{ env.ENGINE_REV }}
@@ -445,7 +550,7 @@ jobs:
           retention-days: 14
 
       - name: Upload to Loongbird Gateway
-        if: ${{ inputs.upload_to_gateway }}
+        if: ${{ steps.check.outputs.skip != 'true' && inputs.upload_to_gateway }}
         shell: pwsh
         env:
           LOONGBIRD_GATEWAY_URL: ${{ inputs.gateway_url }}
@@ -466,10 +571,9 @@ jobs:
       DEPOT_TOOLS_WIN_TOOLCHAIN: '0'
       GYP_MSVS_VERSION: '2022'
     steps:
-      - name: Free runner disk space
+      - name: Enable git longpaths
         shell: pwsh
         run: |
-          Remove-Item -Recurse -Force -ErrorAction SilentlyContinue "C:\Android", "C:\ghcup", "C:\hostedtoolcache\windows\CodeQL"
           git config --global core.longpaths true
           git config --global core.autocrlf false
 
@@ -478,7 +582,39 @@ jobs:
         with:
           fetch-depth: 1
 
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Check existing artifacts on gateway
+        id: check
+        shell: pwsh
+        env:
+          LOONGBIRD_GATEWAY_URL: ${{ inputs.gateway_url }}
+          LOONGBIRD_API_TOKEN: ${{ secrets.LOONGBIRD_API_TOKEN }}
+        run: |
+          $engineRev = (Get-Content -Raw bin/internal/engine.version).Trim()
+          "ENGINE_REV=$engineRev" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          if ("${{ inputs.skip_existing_builds }}" -eq "true" -and $env:LOONGBIRD_API_TOKEN) {
+            python shorebird/ci/loongbird/upload_artifacts.py `
+              --check-exists "flutter_infra_release/flutter/$engineRev/windows-x64/artifacts.zip"
+            if ($LASTEXITCODE -eq 0) {
+              "skip=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+              Write-Host "Windows host_debug artifact already exists on gateway; skipping build."
+              exit 0
+            }
+          }
+          "skip=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+      - name: Free runner disk space
+        if: ${{ steps.check.outputs.skip != 'true' }}
+        shell: pwsh
+        run: |
+          Remove-Item -Recurse -Force -ErrorAction SilentlyContinue "C:\Android", "C:\ghcup", "C:\hostedtoolcache\windows\CodeQL"
+
       - name: Configure git auth, Rust target & depot_tools
+        if: ${{ steps.check.outputs.skip != 'true' }}
         shell: pwsh
         env:
           LOONGBIRD_DART_SDK_TOKEN: ${{ secrets.LOONGBIRD_DART_SDK_TOKEN }}
@@ -492,6 +628,7 @@ jobs:
           "C:\depot_tools" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
 
       - name: gclient sync (minimal Windows host deps)
+        if: ${{ steps.check.outputs.skip != 'true' }}
         shell: pwsh
         run: |
           @'
@@ -516,14 +653,14 @@ jobs:
           gclient.bat sync --no-history --shallow --delete_unversioned_trees
 
       - name: Build Windows host_debug artifacts
+        if: ${{ steps.check.outputs.skip != 'true' }}
         shell: pwsh
         run: |
-          $engineRev = (Get-Content -Raw bin/internal/engine.version).Trim()
-          "ENGINE_REV=$engineRev" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           python3 shorebird/ci/loongbird/run_gn.py
           ninja -C engine/src/out/host_debug flutter/build/archives:artifacts
 
       - name: Stage Windows host_debug artifacts
+        if: ${{ steps.check.outputs.skip != 'true' }}
         shell: pwsh
         run: |
           python3 shorebird/ci/loongbird/upload_artifacts.py `
@@ -531,6 +668,7 @@ jobs:
             --map "engine/src/out/host_debug/zip_archives/windows-x64/artifacts.zip=flutter_infra_release/flutter/$env:ENGINE_REV/windows-x64/artifacts.zip"
 
       - name: Upload GitHub Actions artifacts
+        if: ${{ steps.check.outputs.skip != 'true' }}
         uses: actions/upload-artifact@v4
         with:
           name: loongbird-windows-host-debug-${{ env.ENGINE_REV }}
@@ -538,7 +676,7 @@ jobs:
           retention-days: 14
 
       - name: Upload to Loongbird Gateway
-        if: ${{ inputs.upload_to_gateway }}
+        if: ${{ steps.check.outputs.skip != 'true' && inputs.upload_to_gateway }}
         shell: pwsh
         env:
           LOONGBIRD_GATEWAY_URL: ${{ inputs.gateway_url }}
@@ -575,10 +713,9 @@ jobs:
       DEPOT_TOOLS_WIN_TOOLCHAIN: '0'
       GYP_MSVS_VERSION: '2022'
     steps:
-      - name: Free runner disk space
+      - name: Enable git longpaths
         shell: pwsh
         run: |
-          Remove-Item -Recurse -Force -ErrorAction SilentlyContinue "C:\Android", "C:\ghcup", "C:\hostedtoolcache\windows\CodeQL"
           git config --global core.longpaths true
           git config --global core.autocrlf false
 
@@ -587,7 +724,39 @@ jobs:
         with:
           fetch-depth: 1
 
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Check existing artifacts on gateway
+        id: check
+        shell: pwsh
+        env:
+          LOONGBIRD_GATEWAY_URL: ${{ inputs.gateway_url }}
+          LOONGBIRD_API_TOKEN: ${{ secrets.LOONGBIRD_API_TOKEN }}
+        run: |
+          $engineRev = (Get-Content -Raw bin/internal/engine.version).Trim()
+          "ENGINE_REV=$engineRev" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          if ("${{ inputs.skip_existing_builds }}" -eq "true" -and $env:LOONGBIRD_API_TOKEN) {
+            python shorebird/ci/loongbird/upload_artifacts.py `
+              --check-exists "flutter_infra_release/flutter/$engineRev/${{ matrix.archive_subdir }}/windows-x64.zip"
+            if ($LASTEXITCODE -eq 0) {
+              "skip=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+              Write-Host "Windows Android ${{ matrix.cpu }} gen_snapshot already exists on gateway; skipping build."
+              exit 0
+            }
+          }
+          "skip=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+      - name: Free runner disk space
+        if: ${{ steps.check.outputs.skip != 'true' }}
+        shell: pwsh
+        run: |
+          Remove-Item -Recurse -Force -ErrorAction SilentlyContinue "C:\Android", "C:\ghcup", "C:\hostedtoolcache\windows\CodeQL"
+
       - name: Configure git auth & depot_tools
+        if: ${{ steps.check.outputs.skip != 'true' }}
         shell: pwsh
         env:
           LOONGBIRD_DART_SDK_TOKEN: ${{ secrets.LOONGBIRD_DART_SDK_TOKEN }}
@@ -600,6 +769,7 @@ jobs:
           "C:\depot_tools" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
 
       - name: gclient sync (minimal Windows deps)
+        if: ${{ steps.check.outputs.skip != 'true' }}
         shell: pwsh
         run: |
           @'
@@ -624,10 +794,9 @@ jobs:
           gclient.bat sync --no-history --shallow --delete_unversioned_trees
 
       - name: Build Android ${{ matrix.cpu }} Windows gen_snapshot + analyze_snapshot
+        if: ${{ steps.check.outputs.skip != 'true' }}
         shell: pwsh
         run: |
-          $engineRev = (Get-Content -Raw bin/internal/engine.version).Trim()
-          "ENGINE_REV=$engineRev" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           $gnFlags = @('--android', '--runtime-mode=release')
           if ("${{ matrix.gn_cpu_flag }}") {
             $gnFlags += "${{ matrix.gn_cpu_flag }}"
@@ -636,6 +805,7 @@ jobs:
           ninja -C "engine/src/out/${{ matrix.out_dir }}" flutter/build/archives:archive_win_gen_snapshot
 
       - name: Stage Windows Android gen_snapshot artifact
+        if: ${{ steps.check.outputs.skip != 'true' }}
         shell: pwsh
         run: |
           python3 shorebird/ci/loongbird/upload_artifacts.py `
@@ -643,6 +813,7 @@ jobs:
             --map "engine/src/out/${{ matrix.out_dir }}/zip_archives/${{ matrix.archive_subdir }}/windows-x64.zip=flutter_infra_release/flutter/$env:ENGINE_REV/${{ matrix.archive_subdir }}/windows-x64.zip"
 
       - name: Upload GitHub Actions artifacts
+        if: ${{ steps.check.outputs.skip != 'true' }}
         uses: actions/upload-artifact@v4
         with:
           name: loongbird-windows-android-${{ matrix.cpu }}-${{ env.ENGINE_REV }}
@@ -650,7 +821,7 @@ jobs:
           retention-days: 14
 
       - name: Upload to Loongbird Gateway
-        if: ${{ inputs.upload_to_gateway }}
+        if: ${{ steps.check.outputs.skip != 'true' && inputs.upload_to_gateway }}
         shell: pwsh
         env:
           LOONGBIRD_GATEWAY_URL: ${{ inputs.gateway_url }}
