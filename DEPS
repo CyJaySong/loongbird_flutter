@@ -17,8 +17,8 @@ vars = {
   'llvm_git': 'https://llvm.googlesource.com',
   'skia_revision': 'e9ed4fc9f1544c58d8a9347c1fc9471d8dd7c465',
   # Loongbird dart-sdk fork revision (reconstructed Shorebird-compatible Dart 3.12.2).
-  "dart_sdk_revision": "26b6d032ccd197b8b37c86a1feabd88b2df4c725",
-  "dart_sdk_git": "https://github.com/cyjaysong/loongbird_dart_sdk.git",
+  "dart_sdk_revision": "63264a95993a10f5e4a635f52b43331ed723fe68",
+  "dart_sdk_git": "https://github.com/CyJaySong/loongbird_dart_sdk.git",
   "updater_git": "https://github.com/shorebirdtech/updater.git",
   "updater_rev": "1f85c4ab1ee5b540269b9859c75e1bffbb9050c7",
 

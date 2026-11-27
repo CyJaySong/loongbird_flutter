@@ -1,0 +1,745 @@
+name: Loongbird Desktop & Cross-Host CI (Linux & Windows)
+
+# Builds all Linux x64 and Windows x64 Loongbird Engine / Dart SDK / Android
+# host gen_snapshot / patch CLI artifacts, uploads them to GitHub Actions
+# Artifacts and optionally to Loongbird's self-hosted Engine Artifact Gateway,
+# and runs automated zero-local-engine Linux & Windows Desktop hot-update E2E.
+#
+# Required / Optional Repository Secrets:
+#   LOONGBIRD_DART_SDK_TOKEN  - GitHub PAT with read access to cyjaysong/loongbird_dart_sdk
+#                               (required while loongbird_dart_sdk is private)
+#   LOONGBIRD_API_TOKEN       - Loongbird gateway Bearer token (sb_api_...)
+#                               (required for gateway upload & E2E)
+#   LOONGBIRD_CLI_GIT_URL     - Git clone URL for loongbird CLI repo (required for E2E)
+#   LOONGBIRD_CLI_GIT_TOKEN   - Optional token (or user:token) if CLI repo is private
+
+on:
+  workflow_dispatch:
+    inputs:
+      platforms:
+        description: 'Platforms to build (all, linux, windows)'
+        type: choice
+        default: all
+        options:
+          - all
+          - linux
+          - windows
+      upload_to_gateway:
+        description: 'Upload built artifacts directly to Loongbird Gateway'
+        type: boolean
+        default: true
+      allow_413_fallback:
+        description: 'Warn instead of failing if CDN returns HTTP 413 on large zips (still saved as GHA artifacts)'
+        type: boolean
+        default: true
+      run_e2e:
+        description: 'Run automated zero-local-engine Linux/Windows desktop hot-update E2E after builds'
+        type: boolean
+        default: true
+      gateway_url:
+        description: 'Loongbird Engine Artifact Gateway base URL'
+        type: string
+        default: 'https://api.loongbird.cyjay.fun'
+      e2e_app_id:
+        description: 'Isolated E2E Loongbird app_id'
+        type: string
+        default: '1eb9c933-8d08-4a57-9031-d72e990fa3d3'
+      loongbird_cli_ref:
+        description: 'Branch or tag of loongbird CLI repo for E2E'
+        type: string
+        default: 'loongbird_3.44.9'
+
+concurrency:
+  group: loongbird-desktop-ci-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # ==========================================================================
+  # LINUX x64 SHARDS
+  # ==========================================================================
+
+  linux-host-release:
+    if: ${{ inputs.platforms == 'all' || inputs.platforms == 'linux' }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 180
+    name: '🐧 Linux x64 Host Release (Dart SDK + GTK + patch)'
+    steps:
+      - name: Free runner disk space
+        run: |
+          df -h
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost /usr/local/lib/android /opt/hostedtoolcache/CodeQL
+          df -h
+
+      - name: Checkout loongbird_flutter
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Install Linux build dependencies & Rust target
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libgtk-3-dev libfreetype6-dev pkg-config ninja-build curl zip unzip
+          rustup target add x86_64-unknown-linux-gnu
+
+      - name: Configure git auth & depot_tools
+        env:
+          LOONGBIRD_DART_SDK_TOKEN: ${{ secrets.LOONGBIRD_DART_SDK_TOKEN }}
+        run: |
+          if [ -n "$LOONGBIRD_DART_SDK_TOKEN" ]; then
+            git config --global url."https://x-access-token:${LOONGBIRD_DART_SDK_TOKEN}@github.com/cyjaysong/loongbird_dart_sdk".insteadOf "https://github.com/cyjaysong/loongbird_dart_sdk"
+            git config --global url."https://x-access-token:${LOONGBIRD_DART_SDK_TOKEN}@github.com/CyJaySong/loongbird_dart_sdk".insteadOf "https://github.com/CyJaySong/loongbird_dart_sdk"
+          fi
+          git clone --depth 1 https://chromium.googlesource.com/chromium/tools/depot_tools.git "$HOME/depot_tools"
+          echo "$HOME/depot_tools" >> "$GITHUB_PATH"
+
+      - name: gclient sync (minimal Linux host deps)
+        run: |
+          cat > .gclient <<'EOF'
+          solutions = [
+            {
+              "name": ".",
+              "url": "https://github.com/cyjaysong/loongbird_flutter.git",
+              "deps_file": "DEPS",
+              "managed": False,
+              "custom_vars": {
+                "download_android_deps": False,
+                "download_fuchsia_deps": False,
+                "download_emsdk": False,
+                "download_esbuild": False,
+                "download_jdk": False,
+                "download_dart_sdk": False,
+                "setup_githooks": False,
+              },
+            },
+          ]
+          EOF
+          gclient sync --no-history --shallow --delete_unversioned_trees
+
+      - name: Build Linux host_release (dart_sdk + flutter_gtk) & patch CLI
+        run: |
+          ENGINE_REV="$(tr -d '[:space:]' < bin/internal/engine.version)"
+          echo "ENGINE_REV=$ENGINE_REV" >> "$GITHUB_ENV"
+          echo "Building for ENGINE_REV=$ENGINE_REV"
+
+          cargo build --release --manifest-path engine/src/flutter/third_party/updater/patch/Cargo.toml
+
+          python3 shorebird/ci/loongbird/run_gn.py -- --runtime-mode=release
+          ninja -C engine/src/out/host_release \
+            dart_sdk \
+            flutter/shell/platform/linux:flutter_gtk
+
+      - name: Package & stage Linux host_release artifacts
+        run: |
+          python3 shorebird/ci/loongbird/upload_artifacts.py \
+            --zip-dir "engine/src/out/host_release/dart-sdk=staged_tmp/dart-sdk-linux-x64.zip:dart-sdk" \
+            --zip-file "engine/src/flutter/third_party/updater/patch/target/release/patch=staged_tmp/patch-linux-x64.zip:patch" \
+            --stage-dir staged_artifacts \
+            --map "staged_tmp/dart-sdk-linux-x64.zip=flutter_infra_release/flutter/${ENGINE_REV}/dart-sdk-linux-x64.zip" \
+            --map "engine/src/out/host_release/zip_archives/linux-x64-release/linux-x64-flutter-gtk.zip=flutter_infra_release/flutter/${ENGINE_REV}/linux-x64-release/linux-x64-flutter-gtk.zip" \
+            --map "staged_tmp/patch-linux-x64.zip=shorebird/${ENGINE_REV}/patch-linux-x64.zip"
+
+      - name: Upload GitHub Actions artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: loongbird-linux-host-release-${{ env.ENGINE_REV }}
+          path: staged_artifacts
+          retention-days: 14
+
+      - name: Upload to Loongbird Gateway
+        if: ${{ inputs.upload_to_gateway }}
+        env:
+          LOONGBIRD_GATEWAY_URL: ${{ inputs.gateway_url }}
+          LOONGBIRD_API_TOKEN: ${{ secrets.LOONGBIRD_API_TOKEN }}
+        run: |
+          EXTRA_FLAGS=""
+          if [ "${{ inputs.allow_413_fallback }}" = "true" ]; then
+            EXTRA_FLAGS="--allow-413-fallback"
+          fi
+          python3 shorebird/ci/loongbird/upload_artifacts.py \
+            --upload-dir staged_artifacts \
+            $EXTRA_FLAGS
+
+  linux-host-debug:
+    if: ${{ inputs.platforms == 'all' || inputs.platforms == 'linux' }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 150
+    name: '🐧 Linux x64 Host Debug Artifacts'
+    steps:
+      - name: Free runner disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost /usr/local/lib/android /opt/hostedtoolcache/CodeQL
+
+      - name: Checkout loongbird_flutter
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Install Linux build dependencies & Rust target
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libgtk-3-dev libfreetype6-dev pkg-config ninja-build curl zip unzip
+          rustup target add x86_64-unknown-linux-gnu
+
+      - name: Configure git auth & depot_tools
+        env:
+          LOONGBIRD_DART_SDK_TOKEN: ${{ secrets.LOONGBIRD_DART_SDK_TOKEN }}
+        run: |
+          if [ -n "$LOONGBIRD_DART_SDK_TOKEN" ]; then
+            git config --global url."https://x-access-token:${LOONGBIRD_DART_SDK_TOKEN}@github.com/cyjaysong/loongbird_dart_sdk".insteadOf "https://github.com/cyjaysong/loongbird_dart_sdk"
+            git config --global url."https://x-access-token:${LOONGBIRD_DART_SDK_TOKEN}@github.com/CyJaySong/loongbird_dart_sdk".insteadOf "https://github.com/CyJaySong/loongbird_dart_sdk"
+          fi
+          git clone --depth 1 https://chromium.googlesource.com/chromium/tools/depot_tools.git "$HOME/depot_tools"
+          echo "$HOME/depot_tools" >> "$GITHUB_PATH"
+
+      - name: gclient sync (minimal Linux host deps)
+        run: |
+          cat > .gclient <<'EOF'
+          solutions = [
+            {
+              "name": ".",
+              "url": "https://github.com/cyjaysong/loongbird_flutter.git",
+              "deps_file": "DEPS",
+              "managed": False,
+              "custom_vars": {
+                "download_android_deps": False,
+                "download_fuchsia_deps": False,
+                "download_emsdk": False,
+                "download_esbuild": False,
+                "download_jdk": False,
+                "download_dart_sdk": False,
+                "setup_githooks": False,
+              },
+            },
+          ]
+          EOF
+          gclient sync --no-history --shallow --delete_unversioned_trees
+
+      - name: Build Linux host_debug artifacts
+        run: |
+          ENGINE_REV="$(tr -d '[:space:]' < bin/internal/engine.version)"
+          echo "ENGINE_REV=$ENGINE_REV" >> "$GITHUB_ENV"
+          python3 shorebird/ci/loongbird/run_gn.py
+          ninja -C engine/src/out/host_debug flutter/build/archives:artifacts
+
+      - name: Stage Linux host_debug artifacts
+        run: |
+          python3 shorebird/ci/loongbird/upload_artifacts.py \
+            --stage-dir staged_artifacts \
+            --map "engine/src/out/host_debug/zip_archives/linux-x64/artifacts.zip=flutter_infra_release/flutter/${ENGINE_REV}/linux-x64/artifacts.zip"
+
+      - name: Upload GitHub Actions artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: loongbird-linux-host-debug-${{ env.ENGINE_REV }}
+          path: staged_artifacts
+          retention-days: 14
+
+      - name: Upload to Loongbird Gateway
+        if: ${{ inputs.upload_to_gateway }}
+        env:
+          LOONGBIRD_GATEWAY_URL: ${{ inputs.gateway_url }}
+          LOONGBIRD_API_TOKEN: ${{ secrets.LOONGBIRD_API_TOKEN }}
+        run: |
+          EXTRA_FLAGS=""
+          if [ "${{ inputs.allow_413_fallback }}" = "true" ]; then
+            EXTRA_FLAGS="--allow-413-fallback"
+          fi
+          python3 shorebird/ci/loongbird/upload_artifacts.py \
+            --upload-dir staged_artifacts \
+            $EXTRA_FLAGS
+
+  linux-android-gen-snapshot:
+    if: ${{ inputs.platforms == 'all' || inputs.platforms == 'linux' }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - cpu: arm64
+            gn_cpu_flag: '--android-cpu=arm64'
+            out_dir: android_release_arm64
+            archive_subdir: android-arm64-release
+          - cpu: arm
+            gn_cpu_flag: ''
+            out_dir: android_release
+            archive_subdir: android-arm-release
+          - cpu: x64
+            gn_cpu_flag: '--android-cpu=x64'
+            out_dir: android_release_x64
+            archive_subdir: android-x64-release
+    name: '🐧 Linux x64 Android ${{ matrix.cpu }} gen_snapshot'
+    steps:
+      - name: Free runner disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost /usr/local/lib/android /opt/hostedtoolcache/CodeQL
+
+      - name: Checkout loongbird_flutter
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Configure git auth & depot_tools
+        env:
+          LOONGBIRD_DART_SDK_TOKEN: ${{ secrets.LOONGBIRD_DART_SDK_TOKEN }}
+        run: |
+          if [ -n "$LOONGBIRD_DART_SDK_TOKEN" ]; then
+            git config --global url."https://x-access-token:${LOONGBIRD_DART_SDK_TOKEN}@github.com/cyjaysong/loongbird_dart_sdk".insteadOf "https://github.com/cyjaysong/loongbird_dart_sdk"
+            git config --global url."https://x-access-token:${LOONGBIRD_DART_SDK_TOKEN}@github.com/CyJaySong/loongbird_dart_sdk".insteadOf "https://github.com/CyJaySong/loongbird_dart_sdk"
+          fi
+          git clone --depth 1 https://chromium.googlesource.com/chromium/tools/depot_tools.git "$HOME/depot_tools"
+          echo "$HOME/depot_tools" >> "$GITHUB_PATH"
+
+      - name: gclient sync (Android gen_snapshot deps)
+        run: |
+          cat > .gclient <<'EOF'
+          solutions = [
+            {
+              "name": ".",
+              "url": "https://github.com/cyjaysong/loongbird_flutter.git",
+              "deps_file": "DEPS",
+              "managed": False,
+              "custom_vars": {
+                "download_android_deps": True,
+                "download_fuchsia_deps": False,
+                "download_emsdk": False,
+                "download_esbuild": False,
+                "download_jdk": False,
+                "download_dart_sdk": False,
+                "setup_githooks": False,
+              },
+            },
+          ]
+          EOF
+          gclient sync --no-history --shallow --delete_unversioned_trees
+
+      - name: Build Android ${{ matrix.cpu }} Linux gen_snapshot
+        run: |
+          ENGINE_REV="$(tr -d '[:space:]' < bin/internal/engine.version)"
+          echo "ENGINE_REV=$ENGINE_REV" >> "$GITHUB_ENV"
+          python3 shorebird/ci/loongbird/run_gn.py -- --android ${{ matrix.gn_cpu_flag }} --runtime-mode=release
+          ninja -C "engine/src/out/${{ matrix.out_dir }}" flutter/shell/platform/android:gen_snapshot
+
+      - name: Stage Linux Android gen_snapshot artifact
+        run: |
+          python3 shorebird/ci/loongbird/upload_artifacts.py \
+            --stage-dir staged_artifacts \
+            --map "engine/src/out/${{ matrix.out_dir }}/zip_archives/${{ matrix.archive_subdir }}/linux-x64.zip=flutter_infra_release/flutter/${ENGINE_REV}/${{ matrix.archive_subdir }}/linux-x64.zip"
+
+      - name: Upload GitHub Actions artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: loongbird-linux-android-${{ matrix.cpu }}-${{ env.ENGINE_REV }}
+          path: staged_artifacts
+          retention-days: 14
+
+      - name: Upload to Loongbird Gateway
+        if: ${{ inputs.upload_to_gateway }}
+        env:
+          LOONGBIRD_GATEWAY_URL: ${{ inputs.gateway_url }}
+          LOONGBIRD_API_TOKEN: ${{ secrets.LOONGBIRD_API_TOKEN }}
+        run: |
+          python3 shorebird/ci/loongbird/upload_artifacts.py \
+            --upload-dir staged_artifacts
+
+  # ==========================================================================
+  # WINDOWS x64 SHARDS
+  # ==========================================================================
+
+  windows-host-release:
+    if: ${{ inputs.platforms == 'all' || inputs.platforms == 'windows' }}
+    runs-on: windows-2022
+    timeout-minutes: 240
+    name: '🪟 Windows x64 Host Release (Dart SDK + Flutter DLL + patch.exe)'
+    env:
+      DEPOT_TOOLS_WIN_TOOLCHAIN: '0'
+      GYP_MSVS_VERSION: '2022'
+    steps:
+      - name: Free runner disk space
+        shell: pwsh
+        run: |
+          Get-PSDrive -PSProvider FileSystem
+          Remove-Item -Recurse -Force -ErrorAction SilentlyContinue "C:\Android", "C:\ghcup", "C:\hostedtoolcache\windows\CodeQL"
+          Get-PSDrive -PSProvider FileSystem
+
+      - name: Enable git longpaths & checkout loongbird_flutter
+        shell: pwsh
+        run: |
+          git config --global core.longpaths true
+          git config --global core.autocrlf false
+
+      - name: Checkout loongbird_flutter
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Configure git auth, Rust target & depot_tools
+        shell: pwsh
+        env:
+          LOONGBIRD_DART_SDK_TOKEN: ${{ secrets.LOONGBIRD_DART_SDK_TOKEN }}
+        run: |
+          if ($env:LOONGBIRD_DART_SDK_TOKEN) {
+            git config --global "url.https://x-access-token:$($env:LOONGBIRD_DART_SDK_TOKEN)@github.com/cyjaysong/loongbird_dart_sdk.insteadOf" "https://github.com/cyjaysong/loongbird_dart_sdk"
+            git config --global "url.https://x-access-token:$($env:LOONGBIRD_DART_SDK_TOKEN)@github.com/CyJaySong/loongbird_dart_sdk.insteadOf" "https://github.com/CyJaySong/loongbird_dart_sdk"
+          }
+          rustup target add x86_64-pc-windows-msvc
+          git clone --depth 1 https://chromium.googlesource.com/chromium/tools/depot_tools.git C:\depot_tools
+          "C:\depot_tools" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      - name: gclient sync (minimal Windows host deps)
+        shell: pwsh
+        run: |
+          @'
+          solutions = [
+            {
+              "name": ".",
+              "url": "https://github.com/cyjaysong/loongbird_flutter.git",
+              "deps_file": "DEPS",
+              "managed": False,
+              "custom_vars": {
+                "download_android_deps": False,
+                "download_fuchsia_deps": False,
+                "download_emsdk": False,
+                "download_esbuild": False,
+                "download_jdk": False,
+                "download_dart_sdk": False,
+                "setup_githooks": False,
+              },
+            },
+          ]
+          '@ | Set-Content -Path .gclient -Encoding ascii
+          gclient.bat sync --no-history --shallow --delete_unversioned_trees
+
+      - name: Build Windows host_release (dart_sdk + windows_flutter) & patch.exe
+        shell: pwsh
+        run: |
+          $engineRev = (Get-Content -Raw bin/internal/engine.version).Trim()
+          "ENGINE_REV=$engineRev" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          Write-Host "Building Windows host_release for ENGINE_REV=$engineRev"
+
+          cargo build --release --manifest-path engine/src/flutter/third_party/updater/patch/Cargo.toml
+
+          python3 shorebird/ci/loongbird/run_gn.py -- --runtime-mode=release
+          ninja -C engine/src/out/host_release `
+            dart_sdk `
+            flutter/build/archives:windows_flutter
+
+      - name: Package & stage Windows host_release artifacts
+        shell: pwsh
+        run: |
+          python3 shorebird/ci/loongbird/upload_artifacts.py `
+            --zip-dir "engine/src/out/host_release/dart-sdk=staged_tmp/dart-sdk-windows-x64.zip:dart-sdk" `
+            --zip-file "engine/src/flutter/third_party/updater/patch/target/release/patch.exe=staged_tmp/patch-windows-x64.zip:patch.exe" `
+            --stage-dir staged_artifacts `
+            --map "staged_tmp/dart-sdk-windows-x64.zip=flutter_infra_release/flutter/$env:ENGINE_REV/dart-sdk-windows-x64.zip" `
+            --map "engine/src/out/host_release/zip_archives/windows-x64-release/windows-x64-flutter.zip=flutter_infra_release/flutter/$env:ENGINE_REV/windows-x64-release/windows-x64-flutter.zip" `
+            --map "staged_tmp/patch-windows-x64.zip=shorebird/$env:ENGINE_REV/patch-windows-x64.zip"
+
+      - name: Upload GitHub Actions artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: loongbird-windows-host-release-${{ env.ENGINE_REV }}
+          path: staged_artifacts
+          retention-days: 14
+
+      - name: Upload to Loongbird Gateway
+        if: ${{ inputs.upload_to_gateway }}
+        shell: pwsh
+        env:
+          LOONGBIRD_GATEWAY_URL: ${{ inputs.gateway_url }}
+          LOONGBIRD_API_TOKEN: ${{ secrets.LOONGBIRD_API_TOKEN }}
+        run: |
+          $extra = @()
+          if ("${{ inputs.allow_413_fallback }}" -eq "true") {
+            $extra += "--allow-413-fallback"
+          }
+          python3 shorebird/ci/loongbird/upload_artifacts.py --upload-dir staged_artifacts @extra
+
+  windows-host-debug:
+    if: ${{ inputs.platforms == 'all' || inputs.platforms == 'windows' }}
+    runs-on: windows-2022
+    timeout-minutes: 210
+    name: '🪟 Windows x64 Host Debug Artifacts'
+    env:
+      DEPOT_TOOLS_WIN_TOOLCHAIN: '0'
+      GYP_MSVS_VERSION: '2022'
+    steps:
+      - name: Free runner disk space
+        shell: pwsh
+        run: |
+          Remove-Item -Recurse -Force -ErrorAction SilentlyContinue "C:\Android", "C:\ghcup", "C:\hostedtoolcache\windows\CodeQL"
+          git config --global core.longpaths true
+          git config --global core.autocrlf false
+
+      - name: Checkout loongbird_flutter
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Configure git auth, Rust target & depot_tools
+        shell: pwsh
+        env:
+          LOONGBIRD_DART_SDK_TOKEN: ${{ secrets.LOONGBIRD_DART_SDK_TOKEN }}
+        run: |
+          if ($env:LOONGBIRD_DART_SDK_TOKEN) {
+            git config --global "url.https://x-access-token:$($env:LOONGBIRD_DART_SDK_TOKEN)@github.com/cyjaysong/loongbird_dart_sdk.insteadOf" "https://github.com/cyjaysong/loongbird_dart_sdk"
+            git config --global "url.https://x-access-token:$($env:LOONGBIRD_DART_SDK_TOKEN)@github.com/CyJaySong/loongbird_dart_sdk.insteadOf" "https://github.com/CyJaySong/loongbird_dart_sdk"
+          }
+          rustup target add x86_64-pc-windows-msvc
+          git clone --depth 1 https://chromium.googlesource.com/chromium/tools/depot_tools.git C:\depot_tools
+          "C:\depot_tools" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      - name: gclient sync (minimal Windows host deps)
+        shell: pwsh
+        run: |
+          @'
+          solutions = [
+            {
+              "name": ".",
+              "url": "https://github.com/cyjaysong/loongbird_flutter.git",
+              "deps_file": "DEPS",
+              "managed": False,
+              "custom_vars": {
+                "download_android_deps": False,
+                "download_fuchsia_deps": False,
+                "download_emsdk": False,
+                "download_esbuild": False,
+                "download_jdk": False,
+                "download_dart_sdk": False,
+                "setup_githooks": False,
+              },
+            },
+          ]
+          '@ | Set-Content -Path .gclient -Encoding ascii
+          gclient.bat sync --no-history --shallow --delete_unversioned_trees
+
+      - name: Build Windows host_debug artifacts
+        shell: pwsh
+        run: |
+          $engineRev = (Get-Content -Raw bin/internal/engine.version).Trim()
+          "ENGINE_REV=$engineRev" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          python3 shorebird/ci/loongbird/run_gn.py
+          ninja -C engine/src/out/host_debug flutter/build/archives:artifacts
+
+      - name: Stage Windows host_debug artifacts
+        shell: pwsh
+        run: |
+          python3 shorebird/ci/loongbird/upload_artifacts.py `
+            --stage-dir staged_artifacts `
+            --map "engine/src/out/host_debug/zip_archives/windows-x64/artifacts.zip=flutter_infra_release/flutter/$env:ENGINE_REV/windows-x64/artifacts.zip"
+
+      - name: Upload GitHub Actions artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: loongbird-windows-host-debug-${{ env.ENGINE_REV }}
+          path: staged_artifacts
+          retention-days: 14
+
+      - name: Upload to Loongbird Gateway
+        if: ${{ inputs.upload_to_gateway }}
+        shell: pwsh
+        env:
+          LOONGBIRD_GATEWAY_URL: ${{ inputs.gateway_url }}
+          LOONGBIRD_API_TOKEN: ${{ secrets.LOONGBIRD_API_TOKEN }}
+        run: |
+          $extra = @()
+          if ("${{ inputs.allow_413_fallback }}" -eq "true") {
+            $extra += "--allow-413-fallback"
+          }
+          python3 shorebird/ci/loongbird/upload_artifacts.py --upload-dir staged_artifacts @extra
+
+  windows-android-gen-snapshot:
+    if: ${{ inputs.platforms == 'all' || inputs.platforms == 'windows' }}
+    runs-on: windows-2022
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - cpu: arm64
+            gn_cpu_flag: '--android-cpu=arm64'
+            out_dir: android_release_arm64
+            archive_subdir: android-arm64-release
+          - cpu: arm
+            gn_cpu_flag: ''
+            out_dir: android_release
+            archive_subdir: android-arm-release
+          - cpu: x64
+            gn_cpu_flag: '--android-cpu=x64'
+            out_dir: android_release_x64
+            archive_subdir: android-x64-release
+    name: '🪟 Windows x64 Android ${{ matrix.cpu }} gen_snapshot'
+    env:
+      DEPOT_TOOLS_WIN_TOOLCHAIN: '0'
+      GYP_MSVS_VERSION: '2022'
+    steps:
+      - name: Free runner disk space
+        shell: pwsh
+        run: |
+          Remove-Item -Recurse -Force -ErrorAction SilentlyContinue "C:\Android", "C:\ghcup", "C:\hostedtoolcache\windows\CodeQL"
+          git config --global core.longpaths true
+          git config --global core.autocrlf false
+
+      - name: Checkout loongbird_flutter
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Configure git auth & depot_tools
+        shell: pwsh
+        env:
+          LOONGBIRD_DART_SDK_TOKEN: ${{ secrets.LOONGBIRD_DART_SDK_TOKEN }}
+        run: |
+          if ($env:LOONGBIRD_DART_SDK_TOKEN) {
+            git config --global "url.https://x-access-token:$($env:LOONGBIRD_DART_SDK_TOKEN)@github.com/cyjaysong/loongbird_dart_sdk.insteadOf" "https://github.com/cyjaysong/loongbird_dart_sdk"
+            git config --global "url.https://x-access-token:$($env:LOONGBIRD_DART_SDK_TOKEN)@github.com/CyJaySong/loongbird_dart_sdk.insteadOf" "https://github.com/CyJaySong/loongbird_dart_sdk"
+          }
+          git clone --depth 1 https://chromium.googlesource.com/chromium/tools/depot_tools.git C:\depot_tools
+          "C:\depot_tools" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      - name: gclient sync (minimal Windows deps)
+        shell: pwsh
+        run: |
+          @'
+          solutions = [
+            {
+              "name": ".",
+              "url": "https://github.com/cyjaysong/loongbird_flutter.git",
+              "deps_file": "DEPS",
+              "managed": False,
+              "custom_vars": {
+                "download_android_deps": False,
+                "download_fuchsia_deps": False,
+                "download_emsdk": False,
+                "download_esbuild": False,
+                "download_jdk": False,
+                "download_dart_sdk": False,
+                "setup_githooks": False,
+              },
+            },
+          ]
+          '@ | Set-Content -Path .gclient -Encoding ascii
+          gclient.bat sync --no-history --shallow --delete_unversioned_trees
+
+      - name: Build Android ${{ matrix.cpu }} Windows gen_snapshot + analyze_snapshot
+        shell: pwsh
+        run: |
+          $engineRev = (Get-Content -Raw bin/internal/engine.version).Trim()
+          "ENGINE_REV=$engineRev" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          $gnFlags = @('--android', '--runtime-mode=release')
+          if ("${{ matrix.gn_cpu_flag }}") {
+            $gnFlags += "${{ matrix.gn_cpu_flag }}"
+          }
+          python3 shorebird/ci/loongbird/run_gn.py -- @gnFlags
+          ninja -C "engine/src/out/${{ matrix.out_dir }}" flutter/build/archives:archive_win_gen_snapshot
+
+      - name: Stage Windows Android gen_snapshot artifact
+        shell: pwsh
+        run: |
+          python3 shorebird/ci/loongbird/upload_artifacts.py `
+            --stage-dir staged_artifacts `
+            --map "engine/src/out/${{ matrix.out_dir }}/zip_archives/${{ matrix.archive_subdir }}/windows-x64.zip=flutter_infra_release/flutter/$env:ENGINE_REV/${{ matrix.archive_subdir }}/windows-x64.zip"
+
+      - name: Upload GitHub Actions artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: loongbird-windows-android-${{ matrix.cpu }}-${{ env.ENGINE_REV }}
+          path: staged_artifacts
+          retention-days: 14
+
+      - name: Upload to Loongbird Gateway
+        if: ${{ inputs.upload_to_gateway }}
+        shell: pwsh
+        env:
+          LOONGBIRD_GATEWAY_URL: ${{ inputs.gateway_url }}
+          LOONGBIRD_API_TOKEN: ${{ secrets.LOONGBIRD_API_TOKEN }}
+        run: |
+          python3 shorebird/ci/loongbird/upload_artifacts.py --upload-dir staged_artifacts
+
+  # ==========================================================================
+  # AUTOMATED ZERO-LOCAL-ENGINE DESKTOP E2E VERIFICATION
+  # ==========================================================================
+
+  e2e-linux:
+    if: ${{ (inputs.platforms == 'all' || inputs.platforms == 'linux') && inputs.run_e2e && inputs.upload_to_gateway }}
+    needs:
+      - linux-host-release
+      - linux-host-debug
+      - linux-android-gen-snapshot
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    name: '🧪 Linux Desktop Zero-Local-Engine E2E'
+    steps:
+      - name: Checkout loongbird_flutter
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Install Linux Flutter desktop & Xvfb runtime deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            clang cmake ninja-build pkg-config libgtk-3-dev liblzma-dev \
+            libstdc++-12-dev xvfb libgl1-mesa-dri mesa-utils openssl
+
+      - name: Run automated Linux Desktop E2E
+        env:
+          LOONGBIRD_GATEWAY_URL: ${{ inputs.gateway_url }}
+          LOONGBIRD_API_TOKEN: ${{ secrets.LOONGBIRD_API_TOKEN }}
+          LOONGBIRD_CLI_GIT_URL: ${{ secrets.LOONGBIRD_CLI_GIT_URL }}
+          LOONGBIRD_CLI_GIT_TOKEN: ${{ secrets.LOONGBIRD_CLI_GIT_TOKEN }}
+        run: |
+          if [ -z "$LOONGBIRD_API_TOKEN" ] || [ -z "$LOONGBIRD_CLI_GIT_URL" ]; then
+            echo "Skipping Linux E2E: LOONGBIRD_API_TOKEN or LOONGBIRD_CLI_GIT_URL secret not configured."
+            exit 0
+          fi
+          ENGINE_REV="$(tr -d '[:space:]' < bin/internal/engine.version)"
+          python3 shorebird/ci/loongbird/e2e_desktop.py \
+            --platform linux \
+            --cli-git-url "$LOONGBIRD_CLI_GIT_URL" \
+            --cli-ref "${{ inputs.loongbird_cli_ref }}" \
+            --gateway-url "$LOONGBIRD_GATEWAY_URL" \
+            --token "$LOONGBIRD_API_TOKEN" \
+            --app-id "${{ inputs.e2e_app_id }}" \
+            --engine-rev "$ENGINE_REV" \
+            --release-version "10.0.${{ github.run_number }}+${{ github.run_number }}"
+
+  e2e-windows:
+    if: ${{ (inputs.platforms == 'all' || inputs.platforms == 'windows') && inputs.run_e2e && inputs.upload_to_gateway }}
+    needs:
+      - windows-host-release
+      - windows-host-debug
+      - windows-android-gen-snapshot
+    runs-on: windows-2022
+    timeout-minutes: 60
+    name: '🧪 Windows Desktop Zero-Local-Engine E2E'
+    steps:
+      - name: Checkout loongbird_flutter
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Run automated Windows Desktop E2E
+        shell: pwsh
+        env:
+          LOONGBIRD_GATEWAY_URL: ${{ inputs.gateway_url }}
+          LOONGBIRD_API_TOKEN: ${{ secrets.LOONGBIRD_API_TOKEN }}
+          LOONGBIRD_CLI_GIT_URL: ${{ secrets.LOONGBIRD_CLI_GIT_URL }}
+          LOONGBIRD_CLI_GIT_TOKEN: ${{ secrets.LOONGBIRD_CLI_GIT_TOKEN }}
+        run: |
+          if (-not $env:LOONGBIRD_API_TOKEN -or -not $env:LOONGBIRD_CLI_GIT_URL) {
+            Write-Host "Skipping Windows E2E: LOONGBIRD_API_TOKEN or LOONGBIRD_CLI_GIT_URL secret not configured."
+            exit 0
+          }
+          $engineRev = (Get-Content -Raw bin/internal/engine.version).Trim()
+          python3 shorebird/ci/loongbird/e2e_desktop.py `
+            --platform windows `
+            --cli-git-url "$env:LOONGBIRD_CLI_GIT_URL" `
+            --cli-ref "${{ inputs.loongbird_cli_ref }}" `
+            --gateway-url "$env:LOONGBIRD_GATEWAY_URL" `
+            --token "$env:LOONGBIRD_API_TOKEN" `
+            --app-id "${{ inputs.e2e_app_id }}" `
+            --engine-rev "$engineRev" `
+            --release-version "11.0.${{ github.run_number }}+${{ github.run_number }}"
