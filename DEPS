@@ -20,7 +20,14 @@ vars = {
   "dart_sdk_revision": "2de18df13a2213eae46f8307125c91b7fe84484c",
   "dart_sdk_git": "https://github.com/CyJaySong/loongbird_dart_sdk.git",
   "updater_git": "https://github.com/shorebirdtech/updater.git",
-  "updater_rev": "1f85c4ab1ee5b540269b9859c75e1bffbb9050c7",
+  # 9172015 (upstream #396) verifies a patch's signature at install time, in
+  # every mode. The previously pinned 1f85c4a had no install-time check, so a
+  # bad-signature patch was downloaded, written and promoted to next boot, and
+  # only rejected when the next launch re-verified it.
+  # Deliberately not main: later revisions (fc58a72 #384) require the embedder
+  # to register EngineCallbacks via shorebird_set_engine_callbacks for HTTP and
+  # signature checks, which our desktop shells do not implement yet.
+  "updater_rev": "9172015b514b0c404cfedd356b6b046431bf1062",
 
   # WARNING: DO NOT EDIT canvaskit_cipd_instance MANUALLY
   # See `lib/web_ui/README.md` for how to roll CanvasKit to a new version.
