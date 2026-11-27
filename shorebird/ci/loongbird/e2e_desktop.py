@@ -15,6 +15,7 @@ Verifies the complete self-hosted hot-update loop without --local-engine:
 from __future__ import annotations
 
 import argparse
+import base64
 import os
 import re
 import shutil
@@ -283,6 +284,22 @@ def launch_desktop_app(
   return combined
 
 
+def _extract_url_credentials(raw_url: str) -> tuple[str, str | None, str | None]:
+  """Split optional user[:pass]@ from an HTTP(S) URL, preserving emails with '@'."""
+  m = re.match(r'^(https?://)([^/]+)(/.*)?$', raw_url.strip())
+  if not m:
+    return raw_url.strip(), None, None
+  scheme, authority, rest = m.group(1), m.group(2), m.group(3) or ''
+  if '@' not in authority:
+    return f'{scheme}{authority}{rest}', None, None
+  userinfo, host = authority.rsplit('@', 1)
+  clean_url = f'{scheme}{host}{rest}'
+  if ':' in userinfo:
+    user, pwd = userinfo.split(':', 1)
+    return clean_url, urllib.parse.unquote(user), urllib.parse.unquote(pwd)
+  return clean_url, 'oauth2', urllib.parse.unquote(userinfo)
+
+
 def clone_cli_repo(
     git_url: str,
     ref: str,
@@ -291,26 +308,55 @@ def clone_cli_repo(
 ) -> Path:
   if dest.exists():
     shutil.rmtree(dest)
-  clone_url = git_url
-  if token:
-    parsed = urllib.parse.urlsplit(git_url)
-    auth = token if ':' in token else f'oauth2:{token}'
-    clone_url = urllib.parse.urlunsplit(
-        (parsed.scheme, f'{auth}@{parsed.netloc}', parsed.path, parsed.query, parsed.fragment)
-    )
-  print(f'[e2e] Cloning Loongbird CLI ({ref}) into {dest}...', flush=True)
+
+  clean_url, url_user, url_pwd = _extract_url_credentials(git_url)
+  auth_user: str | None = url_user
+  auth_pwd: str | None = url_pwd
+
+  tok = (token or '').strip()
+  if tok:
+    if tok.startswith(('http://', 'https://')):
+      _, tok_user, tok_pwd = _extract_url_credentials(tok)
+      if tok_pwd:
+        auth_user, auth_pwd = tok_user, tok_pwd
+      else:
+        raise RuntimeError(
+            'LOONGBIRD_CLI_GIT_TOKEN appears to be a URL without embedded credentials. '
+            'Please set LOONGBIRD_CLI_GIT_TOKEN to a GitCode/GitHub Personal Access Token '
+            '(or "username:token").'
+        )
+    elif ':' in tok:
+      auth_user, auth_pwd = tok.split(':', 1)
+    else:
+      auth_user, auth_pwd = 'oauth2', tok
+
+  cmd = ['git', '-c', 'credential.helper=']
+  b64_auth: str | None = None
+  if auth_pwd:
+    b64_auth = base64.b64encode(f'{auth_user or "oauth2"}:{auth_pwd}'.encode()).decode()
+    cmd += ['-c', f'http.extraHeader=Authorization: Basic {b64_auth}']
+  cmd += ['clone', '--depth', '1', '--branch', ref, clean_url, str(dest)]
+
+  clone_env = dict(os.environ)
+  clone_env['GIT_TERMINAL_PROMPT'] = '0'
+  print(
+      f'[e2e] Cloning Loongbird CLI ({ref}) into {dest} '
+      f'(auth={"basic" if b64_auth else "none"})...',
+      flush=True,
+  )
   res = subprocess.run(
-      ['git', 'clone', '--depth', '1', '--branch', ref, clone_url, str(dest)],
+      cmd,
+      env=clone_env,
       capture_output=True,
       text=True,
       timeout=300,
       check=False,
   )
   if res.returncode != 0:
-    # Redact token if present in stderr
     err = (res.stderr or '') + '\n' + (res.stdout or '')
-    if token:
-      err = err.replace(token, '***')
+    for secret in (tok, auth_pwd, b64_auth):
+      if secret:
+        err = err.replace(secret, '***')
     raise RuntimeError(f'git clone of Loongbird CLI failed (rc={res.returncode}):\n{err}')
   return dest
 
