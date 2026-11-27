@@ -22,7 +22,9 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import urllib.error
 import urllib.parse
+import urllib.request
 from pathlib import Path
 
 
@@ -300,6 +302,26 @@ def _extract_url_credentials(raw_url: str) -> tuple[str, str | None, str | None]
   return clean_url, 'oauth2', urllib.parse.unquote(userinfo)
 
 
+def _probe_git_http(clean_url: str, b64_auth: str | None, secrets: list[str]) -> str:
+  """Return non-secret HTTP status/body from git-upload-pack endpoint for diagnosis."""
+  probe_url = clean_url.rstrip('/') + '/info/refs?service=git-upload-pack'
+  headers = {'User-Agent': 'git/2.56.1'}
+  if b64_auth:
+    headers['Authorization'] = f'Basic {b64_auth}'
+  req = urllib.request.Request(probe_url, headers=headers)
+  try:
+    with urllib.request.urlopen(req, timeout=15) as resp:
+      return f'HTTP {resp.status} (final_url_host={urllib.parse.urlsplit(resp.geturl()).netloc})'
+  except urllib.error.HTTPError as e:
+    body = e.read().decode('utf-8', 'replace')[:300]
+    for s in secrets:
+      if s:
+        body = body.replace(s, '***')
+    return f'HTTP {e.code}: {body.strip()}'
+  except Exception as e:
+    return f'probe error: {e}'
+
+
 def clone_cli_repo(
     git_url: str,
     ref: str,
@@ -310,15 +332,17 @@ def clone_cli_repo(
     shutil.rmtree(dest)
 
   clean_url, url_user, url_pwd = _extract_url_credentials(git_url)
-  auth_user: str | None = url_user
-  auth_pwd: str | None = url_pwd
+  candidates: list[tuple[str | None, str | None, str]] = []
 
-  tok = (token or '').strip()
+  tok = (token or '').strip().strip('"').strip("'")
+  if tok.lower().startswith('bearer '):
+    tok = tok[7:].strip()
+
   if tok:
     if tok.startswith(('http://', 'https://')):
       _, tok_user, tok_pwd = _extract_url_credentials(tok)
       if tok_pwd:
-        auth_user, auth_pwd = tok_user, tok_pwd
+        candidates.append((tok_user, tok_pwd, 'url-token'))
       else:
         raise RuntimeError(
             'LOONGBIRD_CLI_GIT_TOKEN appears to be a URL without embedded credentials. '
@@ -326,39 +350,58 @@ def clone_cli_repo(
             '(or "username:token").'
         )
     elif ':' in tok:
-      auth_user, auth_pwd = tok.split(':', 1)
+      u, p = tok.split(':', 1)
+      candidates.append((u, p, 'user:token'))
+      candidates.append(('oauth2', tok, 'raw-token-with-colon'))
     else:
-      auth_user, auth_pwd = 'oauth2', tok
-
-  cmd = ['git', '-c', 'credential.helper=']
-  b64_auth: str | None = None
-  if auth_pwd:
-    b64_auth = base64.b64encode(f'{auth_user or "oauth2"}:{auth_pwd}'.encode()).decode()
-    cmd += ['-c', f'http.extraHeader=Authorization: Basic {b64_auth}']
-  cmd += ['clone', '--depth', '1', '--branch', ref, clean_url, str(dest)]
+      candidates.append(('oauth2', tok, 'token'))
+  elif url_pwd:
+    candidates.append((url_user, url_pwd, 'url-cred'))
+  else:
+    candidates.append((None, None, 'none'))
 
   clone_env = dict(os.environ)
   clone_env['GIT_TERMINAL_PROMPT'] = '0'
-  print(
-      f'[e2e] Cloning Loongbird CLI ({ref}) into {dest} '
-      f'(auth={"basic" if b64_auth else "none"})...',
-      flush=True,
-  )
-  res = subprocess.run(
-      cmd,
-      env=clone_env,
-      capture_output=True,
-      text=True,
-      timeout=300,
-      check=False,
-  )
-  if res.returncode != 0:
+
+  last_err = ''
+  last_probe = ''
+  for auth_user, auth_pwd, mode in candidates:
+    if dest.exists():
+      shutil.rmtree(dest)
+    cmd = ['git', '-c', 'credential.helper=']
+    b64_auth: str | None = None
+    if auth_pwd:
+      b64_auth = base64.b64encode(f'{auth_user or "oauth2"}:{auth_pwd}'.encode()).decode()
+      cmd += ['-c', f'http.extraHeader=Authorization: Basic {b64_auth}']
+    cmd += ['clone', '--depth', '1', '--branch', ref, clean_url, str(dest)]
+
+    print(
+        f'[e2e] Cloning Loongbird CLI ({ref}) into {dest} '
+        f'(auth={mode}, pwd_len={len(auth_pwd) if auth_pwd else 0})...',
+        flush=True,
+    )
+    res = subprocess.run(
+        cmd,
+        env=clone_env,
+        capture_output=True,
+        text=True,
+        timeout=300,
+        check=False,
+    )
+    if res.returncode == 0:
+      return dest
+    secrets = [s for s in (tok, auth_pwd, b64_auth) if s]
     err = (res.stderr or '') + '\n' + (res.stdout or '')
-    for secret in (tok, auth_pwd, b64_auth):
-      if secret:
-        err = err.replace(secret, '***')
-    raise RuntimeError(f'git clone of Loongbird CLI failed (rc={res.returncode}):\n{err}')
-  return dest
+    for secret in secrets:
+      err = err.replace(secret, '***')
+    last_err = err
+    last_probe = _probe_git_http(clean_url, b64_auth, secrets)
+
+  parsed = urllib.parse.urlsplit(clean_url)
+  raise RuntimeError(
+      f'git clone of Loongbird CLI failed (host={parsed.netloc}, path={parsed.path}):\n'
+      f'HTTP probe: {last_probe}\n{last_err}'
+  )
 
 
 def main() -> int:
