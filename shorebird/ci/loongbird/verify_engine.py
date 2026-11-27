@@ -1284,7 +1284,13 @@ def verify_stage4_desktop_hot_update(
             raise RuntimeError(
                 f"Run 4 INSTALLED a patch with an invalid RSA signature:\n{out4}"
             )
-        if "UPDATE_DONE nextPatch=0" not in out4:
+        if "Patch signature could not be verified" not in out4:
+            raise RuntimeError(
+                f"Run 4 refused the patch for an unexpected reason:\n{out4}"
+            )
+        # Patch 1 is still the patch that will boot next, so the refused
+        # Patch 2 must not have taken that slot.
+        if "UPDATE_DONE nextPatch=1" not in out4:
             raise RuntimeError(
                 f"Run 4 left a bad-signature patch queued for next boot:\n{out4}"
             )
