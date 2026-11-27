@@ -455,6 +455,11 @@ def main() -> int:
   parser.add_argument('--cli-git-url', default=None, help='Git URL of loongbird CLI repo to clone if --shorebird-bin is omitted')
   parser.add_argument('--cli-ref', default='loongbird_3.44.9', help='Branch/tag to clone for --cli-git-url')
   parser.add_argument('--gateway-url', required=True)
+  parser.add_argument(
+      '--storage-base-url',
+      default=None,
+      help='Optional override for FLUTTER_STORAGE_BASE_URL (defaults to --gateway-url)',
+  )
   parser.add_argument('--token', required=True)
   parser.add_argument('--app-id', required=True)
   parser.add_argument('--engine-rev', required=True)
@@ -462,7 +467,15 @@ def main() -> int:
   parser.add_argument('--work-dir', type=Path, default=None)
   args = parser.parse_args()
 
-  work_dir = args.work_dir or Path(tempfile.mkdtemp(prefix=f'loongbird_e2e_{args.platform}_'))
+  if args.work_dir:
+    work_dir = args.work_dir
+  elif args.platform == 'windows':
+    try:
+      work_dir = Path(tempfile.mkdtemp(prefix='lb_', dir='C:\\'))
+    except OSError:
+      work_dir = Path(tempfile.mkdtemp(prefix='lb_win_'))
+  else:
+    work_dir = Path(tempfile.mkdtemp(prefix=f'loongbird_e2e_{args.platform}_'))
   work_dir.mkdir(parents=True, exist_ok=True)
   print(f'[e2e] platform={args.platform} version={args.release_version} work_dir={work_dir}')
 
@@ -479,8 +492,9 @@ def main() -> int:
     shorebird_bin = cli_dir / 'bin' / ('shorebird.bat' if args.platform == 'windows' else 'shorebird')
 
   gateway = args.gateway_url.rstrip('/')
+  storage_base = (args.storage_base_url or gateway).rstrip('/')
   env = dict(os.environ)
-  env['FLUTTER_STORAGE_BASE_URL'] = gateway
+  env['FLUTTER_STORAGE_BASE_URL'] = storage_base
   env['SHOREBIRD_HOSTED_URL'] = gateway
   env['SHOREBIRD_TOKEN'] = args.token
   env['CI'] = 'true'

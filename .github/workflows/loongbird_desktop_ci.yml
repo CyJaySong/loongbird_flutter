@@ -878,6 +878,7 @@ jobs:
             --cli-git-url "$LOONGBIRD_CLI_GIT_URL" \
             --cli-ref "${{ inputs.loongbird_cli_ref }}" \
             --gateway-url "$LOONGBIRD_GATEWAY_URL" \
+            --storage-base-url "${LOONGBIRD_GATEWAY_URL%/}/storage/r2" \
             --token "$LOONGBIRD_API_TOKEN" \
             --app-id "${{ inputs.e2e_app_id }}" \
             --engine-rev "$ENGINE_REV" \
@@ -893,6 +894,13 @@ jobs:
     timeout-minutes: 60
     name: '🧪 Windows Desktop Zero-Local-Engine E2E'
     steps:
+      - name: Enable git longpaths
+        shell: pwsh
+        run: |
+          git config --system core.longpaths true
+          git config --global core.longpaths true
+          git config --global core.autocrlf false
+
       - name: Checkout loongbird_flutter
         uses: actions/checkout@v4
         with:
@@ -916,11 +924,13 @@ jobs:
             exit 0
           }
           $engineRev = (Get-Content -Raw bin/internal/engine.version).Trim()
+          $storageBase = "$($env:LOONGBIRD_GATEWAY_URL.TrimEnd('/'))/storage/r2"
           python shorebird/ci/loongbird/e2e_desktop.py `
             --platform windows `
             --cli-git-url "$env:LOONGBIRD_CLI_GIT_URL" `
             --cli-ref "${{ inputs.loongbird_cli_ref }}" `
             --gateway-url "$env:LOONGBIRD_GATEWAY_URL" `
+            --storage-base-url "$storageBase" `
             --token "$env:LOONGBIRD_API_TOKEN" `
             --app-id "${{ inputs.e2e_app_id }}" `
             --engine-rev "$engineRev" `
