@@ -21,7 +21,7 @@ dependency on the Loongbird CLI or external self-hosted gateway:
   Stage 3 — Rust `patch` Binary Diff CLI (`patch-<os>-x64.zip`):
     * Synthetic 64 KiB binary diff generation
 
-  Stage 4 — Full Flutter Desktop Release Build + 3-Run Live RSA-2048 Strict Hot-Update:
+  Stage 4 — Full Flutter Desktop Release Build + 5-Run Live RSA-2048 Strict Hot-Update:
     * Local in-process Artifact Proxy on `127.0.0.1` serves our built zips locally
       and 302-redirects untouched upstream assets (fonts, sky_engine, etc.) directly
       to `https://storage.googleapis.com` for the upstream Flutter 3.44.9 commit
@@ -31,12 +31,15 @@ dependency on the Loongbird CLI or external self-hosted gateway:
     * Builds a real Flutter desktop Release app (BASE) + patched Release (PATCH1)
     * Generates real binary diff with our Rust `patch` tool and signs the
       uncompressed Patch 1 SHA-256 with a fresh RSA-2048 key (`patch_verification: strict`)
-    * Executes 3 consecutive launches of the compiled Release desktop binary:
+    * Executes 5 consecutive launches of the compiled Release desktop binary:
         Run 1: Boots BASE, runs 6/6 Dart stress tests, checks/downloads/verifies
                RSA signature, inflates Patch 1, promotes for next boot
         Run 2: Cold boots directly into Patch 1 (strict boot-time RSA re-verify),
                verifies `marker=PATCH1`, `patch=1`, 6/6 stress tests pass, `upToDate`
         Run 3: Cold re-boots again — confirms Patch 1 stays active with zero rollback
+        Run 4: Offers Patch 2 signed with the wrong key; the update must be refused
+               (behavioural proof that RSA verification is enforced, not just wired)
+        Run 5: Confirms the refused Update left Patch 1 running untouched
 """
 
 from __future__ import annotations
@@ -647,6 +650,7 @@ class MockUpdaterServer:
         self.patch_bytes: bytes | None = None
         self.patch_hash: str | None = None
         self.patch_signature: str | None = None
+        self.patch_number: int = 1
         self.check_requests: list[dict] = []
         self.download_count = 0
         self.events: list[dict] = []
@@ -660,11 +664,18 @@ class MockUpdaterServer:
         host, port = self._server.server_address
         return f"http://{host}:{port}"
 
-    def set_patch(self, patch_bytes: bytes, patch_hash: str, patch_signature: str) -> None:
+    def set_patch(
+        self,
+        patch_bytes: bytes,
+        patch_hash: str,
+        patch_signature: str,
+        number: int = 1,
+    ) -> None:
         with self._lock:
             self.patch_bytes = patch_bytes
             self.patch_hash = patch_hash
             self.patch_signature = patch_signature
+            self.patch_number = number
 
     def start(self) -> None:
         mock = self
@@ -697,6 +708,7 @@ class MockUpdaterServer:
                         patch_bytes = mock.patch_bytes
                         patch_hash = mock.patch_hash
                         patch_sig = mock.patch_signature
+                        patch_number = mock.patch_number
                     cur = payload.get("current_patch_number")
                     _safe_print(
                         f"[mock-updater] POST /api/v1/patches/check "
@@ -704,15 +716,19 @@ class MockUpdaterServer:
                         f"platform={payload.get('platform')} arch={payload.get('arch')} "
                         f"current_patch={cur}\n"
                     )
-                    if patch_bytes is not None and (cur is None or int(cur) < 1):
+                    if patch_bytes is not None and (
+                        cur is None or int(cur) < patch_number
+                    ):
                         self._send_json(
                             200,
                             {
                                 "patch_available": True,
                                 "patch": {
-                                    "number": 1,
+                                    "number": patch_number,
                                     "hash": patch_hash,
-                                    "download_url": f"{mock.base_url}/patches/1.bin",
+                                    "download_url": (
+                                        f"{mock.base_url}/patches/{patch_number}.bin"
+                                    ),
                                     "hash_signature": patch_sig,
                                 },
                             },
@@ -732,7 +748,7 @@ class MockUpdaterServer:
 
             def do_GET(self) -> None:
                 path = self.path.split("?", 1)[0]
-                if path == "/patches/1.bin":
+                if path.startswith("/patches/") and path.endswith(".bin"):
                     with mock._lock:
                         data = mock.patch_bytes
                         if data is not None:
@@ -740,7 +756,7 @@ class MockUpdaterServer:
                     if data is None:
                         self._send_json(404, {"error": "patch not configured"})
                         return
-                    _safe_print(f"[mock-updater] GET /patches/1.bin ({len(data)} B)\n")
+                    _safe_print(f"[mock-updater] GET {path} ({len(data)} B)\n")
                     self.close_connection = True
                     self.send_response(200)
                     self.send_header("Content-Type", "application/octet-stream")
@@ -1197,13 +1213,13 @@ def verify_stage4_desktop_hot_update(
         ]:
             if token not in out1:
                 raise RuntimeError(f"Run 1 missing expected token '{token}':\n{out1}")
-        # Signing must actually be enabled: patch_public_key only reaches the
-        # bundled shorebird.yaml via SHOREBIRD_PUBLIC_KEY, and a patch that
-        # verifies proves the RSA-2048 PKCS#1 v1.5 SHA-256 signature check ran.
+        # Signing must actually be enabled in the built artifact:
+        # patch_public_key only reaches the bundled shorebird.yaml via
+        # SHOREBIRD_PUBLIC_KEY (flutter_tools drops the yaml key). Whether the
+        # signature is really enforced is proven by Run 4 below, which offers a
+        # patch whose signature does not match and requires a refusal.
         if "patch_public_key: None" in out1:
             raise RuntimeError(f"Run 1 built without patch_public_key:\n{out1}")
-        if "Patch signature is valid" not in out1:
-            raise RuntimeError(f"Run 1 did not report a valid patch signature:\n{out1}")
         if "FATAL err=" in out1:
             raise RuntimeError(f"Run 1 reported error:\n{out1}")
 
@@ -1247,6 +1263,51 @@ def verify_stage4_desktop_hot_update(
                 raise RuntimeError(f"Run 3 missing expected token '{token}':\n{out3}")
         if "FATAL err=" in out3:
             raise RuntimeError(f"Run 3 reported fatal error:\n{out3}")
+
+        # Run 4: a patch whose RSA signature does not match must be refused.
+        # This is the behavioural proof that signature verification is really
+        # enforced (a log-string assertion depends on log levels/messages).
+        downloads_before_reject = mock.download_count
+        bad_signature = sign_sha256_hex(priv_pem, "0" * 64)
+        mock.set_patch(patch_bytes, patch_hash, bad_signature, number=2)
+        out4 = run_desktop_app(
+            release_exe,
+            platform,
+            "Run 4 (Patch 2 With Wrong Signature Must Be Refused)",
+            work / "run4.log",
+            {**run_env, "LOONGBIRD_VERIFY_DO_UPDATE": "1"},
+        )
+        for token in ["marker=PATCH1", "available=true", "patch=1", "passed=6/6"]:
+            if token not in out4:
+                raise RuntimeError(f"Run 4 missing expected token '{token}':\n{out4}")
+        if "UPDATE_RESULT status=1" in out4:
+            raise RuntimeError(
+                f"Run 4 INSTALLED a patch with an invalid RSA signature:\n{out4}"
+            )
+        if "UPDATE_DONE nextPatch=0" not in out4:
+            raise RuntimeError(
+                f"Run 4 left a bad-signature patch queued for next boot:\n{out4}"
+            )
+        downloads_after_reject = mock.download_count
+        _safe_print(
+            f"[stage4] Run 4 rejected the bad-signature patch "
+            f"(downloads_before={downloads_before_reject}, "
+            f"downloads_after={downloads_after_reject})\n"
+        )
+
+        # Run 5: the refusal must not disturb the running Patch 1.
+        out5 = run_desktop_app(
+            release_exe,
+            platform,
+            "Run 5 (Still Patch 1 After Refused Update)",
+            work / "run5.log",
+            {**run_env, "LOONGBIRD_VERIFY_DO_UPDATE": "0"},
+        )
+        for token in ["marker=PATCH1", "available=true", "patch=1", "passed=6/6"]:
+            if token not in out5:
+                raise RuntimeError(f"Run 5 missing expected token '{token}':\n{out5}")
+        if "FATAL err=" in out5:
+            raise RuntimeError(f"Run 5 reported fatal error:\n{out5}")
 
         # Verify Mock Updater Server observed the full protocol handshake
         if len(mock.check_requests) < 2:
