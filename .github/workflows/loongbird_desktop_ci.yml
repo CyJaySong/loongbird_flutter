@@ -3,27 +3,35 @@ name: Loongbird Desktop & Cross-Host CI (Linux & Windows)
 # Builds all Linux x64 and Windows x64 Loongbird Engine / Dart SDK / Android
 # host gen_snapshot / patch CLI artifacts, uploads them to GitHub Actions
 # Artifacts and optionally to Loongbird's self-hosted Engine Artifact Gateway,
-# and runs automated zero-local-engine Linux & Windows Desktop hot-update E2E.
+# and runs pure-engine functional verification (Dart SDK + AOT + Android 3-ABI
+# gen_snapshot + Rust patch + 3-run desktop RSA-2048 strict hot-update against
+# local 127.0.0.1 mock servers — zero CLI or external gateway dependency).
 #
 # Required / Optional Repository Secrets:
 #   LOONGBIRD_DART_SDK_TOKEN  - GitHub PAT with read access to cyjaysong/loongbird_dart_sdk
 #                               (required while loongbird_dart_sdk is private)
-#   LOONGBIRD_API_TOKEN       - Loongbird gateway Bearer token (sb_api_...)
-#                               (required for gateway upload & E2E)
-#   LOONGBIRD_CLI_GIT_URL     - Git clone URL for loongbird CLI repo (required for E2E)
-#   LOONGBIRD_CLI_GIT_TOKEN   - Optional token (or user:token) if CLI repo is private
+#   LOONGBIRD_API_TOKEN       - Optional Loongbird gateway Bearer token (sb_api_...)
+#                               (only needed when upload_to_gateway=true or skip_existing_builds=true)
+
+permissions:
+  contents: read
+  actions: read
 
 on:
   workflow_dispatch:
     inputs:
       platforms:
-        description: 'Platforms to build (all, linux, windows)'
+        description: 'Platforms to build/verify (all, linux, windows)'
         type: choice
         default: all
         options:
           - all
           - linux
           - windows
+      verify_only:
+        description: 'Skip all build shards and only run pure-engine verification against latest GHA artifacts'
+        type: boolean
+        default: false
       upload_to_gateway:
         description: 'Upload built artifacts directly to Loongbird Gateway'
         type: boolean
@@ -36,22 +44,14 @@ on:
         description: 'Warn instead of failing if CDN returns HTTP 413 on large zips (still saved as GHA artifacts)'
         type: boolean
         default: true
-      run_e2e:
-        description: 'Run automated zero-local-engine Linux/Windows desktop hot-update E2E after builds'
+      run_verify:
+        description: 'Run pure-engine Linux/Windows functional verification after builds'
         type: boolean
         default: true
       gateway_url:
         description: 'Loongbird Engine Artifact Gateway base URL'
         type: string
         default: 'https://api.loongbird.cyjay.fun'
-      e2e_app_id:
-        description: 'Isolated E2E Loongbird app_id'
-        type: string
-        default: '1eb9c933-8d08-4a57-9031-d72e990fa3d3'
-      loongbird_cli_ref:
-        description: 'Branch or tag of loongbird CLI repo for E2E'
-        type: string
-        default: 'loongbird_3.44.9'
 
 concurrency:
   group: loongbird-desktop-ci-${{ github.ref }}-${{ inputs.platforms }}
@@ -63,7 +63,7 @@ jobs:
   # ==========================================================================
 
   linux-host-release:
-    if: ${{ inputs.platforms == 'all' || inputs.platforms == 'linux' }}
+    if: ${{ !inputs.verify_only && (inputs.platforms == 'all' || inputs.platforms == 'linux') }}
     runs-on: ubuntu-22.04
     timeout-minutes: 180
     name: '🐧 Linux x64 Host Release (Dart SDK + GTK + patch)'
@@ -190,7 +190,7 @@ jobs:
             $EXTRA_FLAGS
 
   linux-host-debug:
-    if: ${{ inputs.platforms == 'all' || inputs.platforms == 'linux' }}
+    if: ${{ !inputs.verify_only && (inputs.platforms == 'all' || inputs.platforms == 'linux') }}
     runs-on: ubuntu-22.04
     timeout-minutes: 150
     name: '🐧 Linux x64 Host Debug Artifacts'
@@ -303,7 +303,7 @@ jobs:
             $EXTRA_FLAGS
 
   linux-android-gen-snapshot:
-    if: ${{ inputs.platforms == 'all' || inputs.platforms == 'linux' }}
+    if: ${{ !inputs.verify_only && (inputs.platforms == 'all' || inputs.platforms == 'linux') }}
     runs-on: ubuntu-22.04
     timeout-minutes: 90
     strategy:
@@ -423,7 +423,7 @@ jobs:
   # ==========================================================================
 
   windows-host-release:
-    if: ${{ inputs.platforms == 'all' || inputs.platforms == 'windows' }}
+    if: ${{ !inputs.verify_only && (inputs.platforms == 'all' || inputs.platforms == 'windows') }}
     runs-on: windows-2022
     timeout-minutes: 240
     name: '🪟 Windows x64 Host Release (Dart SDK + Flutter DLL + patch.exe)'
@@ -565,7 +565,7 @@ jobs:
           python3 shorebird/ci/loongbird/upload_artifacts.py --upload-dir staged_artifacts @extra
 
   windows-host-debug:
-    if: ${{ inputs.platforms == 'all' || inputs.platforms == 'windows' }}
+    if: ${{ !inputs.verify_only && (inputs.platforms == 'all' || inputs.platforms == 'windows') }}
     runs-on: windows-2022
     timeout-minutes: 210
     name: '🪟 Windows x64 Host Debug Artifacts'
@@ -693,7 +693,7 @@ jobs:
           python3 shorebird/ci/loongbird/upload_artifacts.py --upload-dir staged_artifacts @extra
 
   windows-android-gen-snapshot:
-    if: ${{ inputs.platforms == 'all' || inputs.platforms == 'windows' }}
+    if: ${{ !inputs.verify_only && (inputs.platforms == 'all' || inputs.platforms == 'windows') }}
     runs-on: windows-2022
     timeout-minutes: 120
     strategy:
@@ -836,18 +836,31 @@ jobs:
           python3 shorebird/ci/loongbird/upload_artifacts.py --upload-dir staged_artifacts
 
   # ==========================================================================
-  # AUTOMATED ZERO-LOCAL-ENGINE DESKTOP E2E VERIFICATION
+  # PURE-ENGINE FUNCTIONAL VERIFICATION (ZERO CLI / ZERO EXTERNAL GATEWAY)
   # ==========================================================================
 
-  e2e-linux:
-    if: ${{ (inputs.platforms == 'all' || inputs.platforms == 'linux') && inputs.run_e2e && inputs.upload_to_gateway }}
+  verify-linux:
+    if: >-
+      ${{
+        !cancelled() &&
+        inputs.run_verify &&
+        (inputs.platforms == 'all' || inputs.platforms == 'linux') &&
+        (
+          inputs.verify_only ||
+          (
+            needs.linux-host-release.result == 'success' &&
+            needs.linux-host-debug.result == 'success' &&
+            needs.linux-android-gen-snapshot.result == 'success'
+          )
+        )
+      }}
     needs:
       - linux-host-release
       - linux-host-debug
       - linux-android-gen-snapshot
     runs-on: ubuntu-22.04
-    timeout-minutes: 60
-    name: '🧪 Linux Desktop Zero-Local-Engine E2E'
+    timeout-minutes: 45
+    name: '🧪 Linux x64 Pure-Engine Functional Verification'
     steps:
       - name: Checkout loongbird_flutter
         uses: actions/checkout@v4
@@ -861,38 +874,47 @@ jobs:
             clang cmake ninja-build pkg-config libgtk-3-dev liblzma-dev \
             libstdc++-12-dev xvfb libgl1-mesa-dri mesa-utils openssl
 
-      - name: Run automated Linux Desktop E2E
+      - name: Fetch staged Linux x64 artifacts from GitHub Actions
         env:
-          LOONGBIRD_GATEWAY_URL: ${{ inputs.gateway_url }}
-          LOONGBIRD_API_TOKEN: ${{ secrets.LOONGBIRD_API_TOKEN }}
-          LOONGBIRD_CLI_GIT_URL: ${{ secrets.LOONGBIRD_CLI_GIT_URL }}
-          LOONGBIRD_CLI_GIT_TOKEN: ${{ secrets.LOONGBIRD_CLI_GIT_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          if [ -z "$LOONGBIRD_API_TOKEN" ] || [ -z "$LOONGBIRD_CLI_GIT_URL" ]; then
-            echo "Skipping Linux E2E: LOONGBIRD_API_TOKEN or LOONGBIRD_CLI_GIT_URL secret not configured."
-            exit 0
-          fi
           ENGINE_REV="$(tr -d '[:space:]' < bin/internal/engine.version)"
-          python3 shorebird/ci/loongbird/e2e_desktop.py \
+          python3 shorebird/ci/loongbird/fetch_gha_artifacts.py \
             --platform linux \
-            --cli-git-url "$LOONGBIRD_CLI_GIT_URL" \
-            --cli-ref "${{ inputs.loongbird_cli_ref }}" \
-            --gateway-url "$LOONGBIRD_GATEWAY_URL" \
-            --storage-base-url "${LOONGBIRD_GATEWAY_URL%/}/storage/r2" \
-            --token "$LOONGBIRD_API_TOKEN" \
-            --app-id "${{ inputs.e2e_app_id }}" \
             --engine-rev "$ENGINE_REV" \
-            --release-version "10.0.${{ github.run_number }}+${{ github.run_number }}"
+            --output-dir staged_artifacts
 
-  e2e-windows:
-    if: ${{ (inputs.platforms == 'all' || inputs.platforms == 'windows') && inputs.run_e2e && inputs.upload_to_gateway }}
+      - name: Run 4-stage Linux pure-engine functional verification
+        run: |
+          ENGINE_REV="$(tr -d '[:space:]' < bin/internal/engine.version)"
+          python3 shorebird/ci/loongbird/verify_engine.py \
+            --platform linux \
+            --artifacts-dir staged_artifacts \
+            --flutter-root "$PWD" \
+            --engine-rev "$ENGINE_REV"
+
+  verify-windows:
+    if: >-
+      ${{
+        !cancelled() &&
+        inputs.run_verify &&
+        (inputs.platforms == 'all' || inputs.platforms == 'windows') &&
+        (
+          inputs.verify_only ||
+          (
+            needs.windows-host-release.result == 'success' &&
+            needs.windows-host-debug.result == 'success' &&
+            needs.windows-android-gen-snapshot.result == 'success'
+          )
+        )
+      }}
     needs:
       - windows-host-release
       - windows-host-debug
       - windows-android-gen-snapshot
     runs-on: windows-2022
-    timeout-minutes: 60
-    name: '🧪 Windows Desktop Zero-Local-Engine E2E'
+    timeout-minutes: 45
+    name: '🧪 Windows x64 Pure-Engine Functional Verification'
     steps:
       - name: Enable git longpaths
         shell: pwsh
@@ -911,27 +933,28 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Run automated Windows Desktop E2E
+      - name: Fetch staged Windows x64 artifacts from GitHub Actions
         shell: pwsh
         env:
-          LOONGBIRD_GATEWAY_URL: ${{ inputs.gateway_url }}
-          LOONGBIRD_API_TOKEN: ${{ secrets.LOONGBIRD_API_TOKEN }}
-          LOONGBIRD_CLI_GIT_URL: ${{ secrets.LOONGBIRD_CLI_GIT_URL }}
-          LOONGBIRD_CLI_GIT_TOKEN: ${{ secrets.LOONGBIRD_CLI_GIT_TOKEN }}
+          PYTHONUTF8: '1'
+          PYTHONIOENCODING: 'utf-8:replace'
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          if (-not $env:LOONGBIRD_API_TOKEN -or -not $env:LOONGBIRD_CLI_GIT_URL) {
-            Write-Host "Skipping Windows E2E: LOONGBIRD_API_TOKEN or LOONGBIRD_CLI_GIT_URL secret not configured."
-            exit 0
-          }
           $engineRev = (Get-Content -Raw bin/internal/engine.version).Trim()
-          $storageBase = "$($env:LOONGBIRD_GATEWAY_URL.TrimEnd('/'))/storage/r2"
-          python shorebird/ci/loongbird/e2e_desktop.py `
+          python shorebird/ci/loongbird/fetch_gha_artifacts.py `
             --platform windows `
-            --cli-git-url "$env:LOONGBIRD_CLI_GIT_URL" `
-            --cli-ref "${{ inputs.loongbird_cli_ref }}" `
-            --gateway-url "$env:LOONGBIRD_GATEWAY_URL" `
-            --storage-base-url "$storageBase" `
-            --token "$env:LOONGBIRD_API_TOKEN" `
-            --app-id "${{ inputs.e2e_app_id }}" `
             --engine-rev "$engineRev" `
-            --release-version "11.0.${{ github.run_number }}+${{ github.run_number }}"
+            --output-dir staged_artifacts
+
+      - name: Run 4-stage Windows pure-engine functional verification
+        shell: pwsh
+        env:
+          PYTHONUTF8: '1'
+          PYTHONIOENCODING: 'utf-8:replace'
+        run: |
+          $engineRev = (Get-Content -Raw bin/internal/engine.version).Trim()
+          python shorebird/ci/loongbird/verify_engine.py `
+            --platform windows `
+            --artifacts-dir staged_artifacts `
+            --flutter-root "$PWD" `
+            --engine-rev "$engineRev"
