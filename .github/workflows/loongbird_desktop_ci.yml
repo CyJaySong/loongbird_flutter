@@ -54,7 +54,7 @@ on:
         default: 'loongbird_3.44.9'
 
 concurrency:
-  group: loongbird-desktop-ci-${{ github.ref }}
+  group: loongbird-desktop-ci-${{ github.ref }}-${{ inputs.platforms }}
   cancel-in-progress: false
 
 jobs:

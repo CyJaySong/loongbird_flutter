@@ -352,8 +352,8 @@ def main() -> int:
                       help='Skip uploading artifacts that already return HTTP 200 on HEAD')
   parser.add_argument('--allow-413-fallback', action='store_true',
                       help='Warn instead of failing on HTTP 413 (useful behind 100 MiB CDNs)')
-  parser.add_argument('--chunk-size-mb', type=int, default=4,
-                      help='Chunk size in MiB for large uploads (default: 4; 0 disables chunking)')
+  parser.add_argument('--chunk-size-mb', type=int, default=1,
+                      help='Chunk size in MiB for large uploads (default: 1; 0 disables chunking)')
   args = parser.parse_args()
 
   if args.check_exists:
