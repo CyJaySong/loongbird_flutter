@@ -1048,10 +1048,15 @@ def verify_stage4_desktop_hot_update(
         # Ensure Flutter's pub uses public pub.dev cleanly on GitHub runners.
         build_env.pop("PUB_HOSTED_URL", None)
 
-        _, fver = run_cmd([*flutter_cmd, "--version", "--suppress-analytics"], env=build_env, timeout=600)
-        _safe_print(f"[stage4] flutter --version output verified.\n")
-        if engine_rev[:10] not in fver:
-            raise RuntimeError(f"Expected engine rev {engine_rev[:10]} in flutter --version:\n{fver}")
+        run_cmd([*flutter_cmd, "--version", "--suppress-analytics"], env=build_env, timeout=600)
+        # `flutter --version` prints the engine hash from the informational
+        # engine_stamp.json (not produced by our build), so verify the engine
+        # revision the tool actually resolves via bin/cache/engine.stamp instead.
+        stamp_file = flutter_root / "bin" / "cache" / "engine.stamp"
+        stamp = stamp_file.read_text(encoding="utf-8").strip() if stamp_file.is_file() else ""
+        if stamp != engine_rev:
+            raise RuntimeError(f"Expected bin/cache/engine.stamp={engine_rev}, got '{stamp}'")
+        _safe_print(f"[stage4] bin/cache/engine.stamp verified: {stamp}\n")
 
         dart_sdk_rel = f"flutter_infra_release/flutter/{engine_rev}/dart-sdk-{platform}-x64.zip"
         if proxy.local_hits.get(dart_sdk_rel, 0) < 1:
