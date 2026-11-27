@@ -721,6 +721,11 @@ jobs:
         with:
           fetch-depth: 1
 
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
       - name: Run automated Windows Desktop E2E
         shell: pwsh
         env:
@@ -734,7 +739,7 @@ jobs:
             exit 0
           }
           $engineRev = (Get-Content -Raw bin/internal/engine.version).Trim()
-          python3 shorebird/ci/loongbird/e2e_desktop.py `
+          python shorebird/ci/loongbird/e2e_desktop.py `
             --platform windows `
             --cli-git-url "$env:LOONGBIRD_CLI_GIT_URL" `
             --cli-ref "${{ inputs.loongbird_cli_ref }}" `
