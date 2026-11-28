@@ -115,6 +115,7 @@ def main(argv: list[str]) -> int:
         description="Fetch Loongbird staged artifacts from GitHub Actions Artifacts."
     )
     parser.add_argument("--platform", required=True, choices=["linux", "windows"])
+    parser.add_argument("--arch", default="x64", choices=["x64", "arm64"])
     parser.add_argument("--engine-rev", required=True)
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--repo", default=os.environ.get("GITHUB_REPOSITORY", ""))
@@ -129,13 +130,19 @@ def main(argv: list[str]) -> int:
 
     rev = args.engine_rev.strip()
     plat = args.platform
-    artifact_names = [
-        f"loongbird-{plat}-host-release-{rev}",
-        f"loongbird-{plat}-host-debug-{rev}",
-        f"loongbird-{plat}-android-arm64-{rev}",
-        f"loongbird-{plat}-android-arm-{rev}",
-        f"loongbird-{plat}-android-x64-{rev}",
-    ]
+    if args.arch == "arm64":
+        artifact_names = [
+            f"loongbird-{plat}-arm64-host-release-{rev}",
+            f"loongbird-{plat}-arm64-host-debug-{rev}",
+        ]
+    else:
+        artifact_names = [
+            f"loongbird-{plat}-host-release-{rev}",
+            f"loongbird-{plat}-host-debug-{rev}",
+            f"loongbird-{plat}-android-arm64-{rev}",
+            f"loongbird-{plat}-android-arm-{rev}",
+            f"loongbird-{plat}-android-x64-{rev}",
+        ]
 
     output_dir = Path(args.output_dir).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)

@@ -21,13 +21,16 @@ on:
   workflow_dispatch:
     inputs:
       platforms:
-        description: 'Platforms to build/verify (all, linux, windows)'
+        description: 'Platforms to build/verify (all, linux, windows, arm64, linux-arm64, windows-arm64)'
         type: choice
         default: all
         options:
           - all
           - linux
           - windows
+          - arm64
+          - linux-arm64
+          - windows-arm64
       verify_only:
         description: 'Skip all build shards and only run pure-engine verification against latest GHA artifacts'
         type: boolean
@@ -955,6 +958,698 @@ jobs:
           $engineRev = (Get-Content -Raw bin/internal/engine.version).Trim()
           python shorebird/ci/loongbird/verify_engine.py `
             --platform windows `
+            --artifacts-dir staged_artifacts `
+            --flutter-root "$PWD" `
+            --engine-rev "$engineRev"
+
+  # ==========================================================================
+  # LINUX ARM64 SHARDS (Native ubuntu-24.04-arm)
+  # ==========================================================================
+
+  linux-arm64-host-release:
+    if: ${{ !inputs.verify_only && (inputs.platforms == 'all' || inputs.platforms == 'arm64' || inputs.platforms == 'linux-arm64') }}
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 180
+    name: '🐧 Linux ARM64 Host Release (Dart SDK + GTK + patch)'
+    steps:
+      - name: Checkout loongbird_flutter
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Check existing artifacts on gateway
+        id: check
+        env:
+          LOONGBIRD_GATEWAY_URL: ${{ inputs.gateway_url }}
+          LOONGBIRD_API_TOKEN: ${{ secrets.LOONGBIRD_API_TOKEN }}
+        run: |
+          ENGINE_REV="$(tr -d '[:space:]' < bin/internal/engine.version)"
+          echo "ENGINE_REV=$ENGINE_REV" >> "$GITHUB_ENV"
+          if [ "${{ inputs.skip_existing_builds }}" = "true" ] && [ -n "$LOONGBIRD_API_TOKEN" ]; then
+            if python3 shorebird/ci/loongbird/upload_artifacts.py \
+              --check-exists "flutter_infra_release/flutter/${ENGINE_REV}/dart-sdk-linux-arm64.zip" \
+              --check-exists "flutter_infra_release/flutter/${ENGINE_REV}/linux-arm64-release/linux-arm64-flutter-gtk.zip" \
+              --check-exists "shorebird/${ENGINE_REV}/patch-linux-arm64.zip"; then
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+              echo "All Linux ARM64 host_release artifacts already exist on gateway; skipping build."
+              exit 0
+            fi
+          fi
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+
+      - name: Free runner disk space
+        if: ${{ steps.check.outputs.skip != 'true' }}
+        run: |
+          df -h
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost /usr/local/lib/android /opt/hostedtoolcache/CodeQL
+          df -h
+
+      - name: Install Linux ARM64 build dependencies & Rust target
+        if: ${{ steps.check.outputs.skip != 'true' }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libgtk-3-dev libfreetype6-dev pkg-config ninja-build curl zip unzip build-essential
+          if ! command -v rustup >/dev/null 2>&1; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+            export PATH="$HOME/.cargo/bin:$PATH"
+            echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          fi
+          rustup target add aarch64-unknown-linux-gnu
+
+      - name: Configure git auth & depot_tools
+        if: ${{ steps.check.outputs.skip != 'true' }}
+        env:
+          LOONGBIRD_DART_SDK_TOKEN: ${{ secrets.LOONGBIRD_DART_SDK_TOKEN }}
+        run: |
+          if [ -n "$LOONGBIRD_DART_SDK_TOKEN" ]; then
+            git config --global url."https://x-access-token:${LOONGBIRD_DART_SDK_TOKEN}@github.com/cyjaysong/loongbird_dart_sdk".insteadOf "https://github.com/cyjaysong/loongbird_dart_sdk"
+            git config --global url."https://x-access-token:${LOONGBIRD_DART_SDK_TOKEN}@github.com/CyJaySong/loongbird_dart_sdk".insteadOf "https://github.com/CyJaySong/loongbird_dart_sdk"
+          fi
+          git clone --depth 1 https://chromium.googlesource.com/chromium/tools/depot_tools.git "$HOME/depot_tools"
+          echo "$HOME/depot_tools" >> "$GITHUB_PATH"
+
+      - name: gclient sync (minimal Linux ARM64 host deps)
+        if: ${{ steps.check.outputs.skip != 'true' }}
+        run: |
+          cat > .gclient <<'EOF'
+          solutions = [
+            {
+              "name": ".",
+              "url": "https://github.com/cyjaysong/loongbird_flutter.git",
+              "deps_file": "DEPS",
+              "managed": False,
+              "custom_vars": {
+                "download_android_deps": False,
+                "download_fuchsia_deps": False,
+                "download_emsdk": False,
+                "download_esbuild": False,
+                "download_jdk": False,
+                "download_dart_sdk": False,
+                "setup_githooks": False,
+              },
+            },
+          ]
+          EOF
+          gclient sync --no-history --shallow --delete_unversioned_trees
+
+      - name: Build Linux ARM64 host_release (dart_sdk + flutter_gtk) & patch CLI
+        if: ${{ steps.check.outputs.skip != 'true' }}
+        run: |
+          echo "Building Linux ARM64 host_release for ENGINE_REV=$ENGINE_REV"
+
+          cargo build --release --target aarch64-unknown-linux-gnu --manifest-path engine/src/flutter/third_party/updater/patch/Cargo.toml
+
+          python3 shorebird/ci/loongbird/run_gn.py -- --runtime-mode=release --target-os=linux --linux-cpu=arm64
+          ninja -C engine/src/out/linux_release_arm64 \
+            dart_sdk \
+            flutter/shell/platform/linux:flutter_gtk
+
+      - name: Package & stage Linux ARM64 host_release artifacts
+        if: ${{ steps.check.outputs.skip != 'true' }}
+        run: |
+          python3 shorebird/ci/loongbird/upload_artifacts.py \
+            --zip-dir "engine/src/out/linux_release_arm64/dart-sdk=staged_tmp/dart-sdk-linux-arm64.zip:dart-sdk" \
+            --zip-file "engine/src/flutter/third_party/updater/target/aarch64-unknown-linux-gnu/release/patch=staged_tmp/patch-linux-arm64.zip:patch" \
+            --stage-dir staged_artifacts \
+            --map "staged_tmp/dart-sdk-linux-arm64.zip=flutter_infra_release/flutter/${ENGINE_REV}/dart-sdk-linux-arm64.zip" \
+            --map "engine/src/out/linux_release_arm64/zip_archives/linux-arm64-release/linux-arm64-flutter-gtk.zip=flutter_infra_release/flutter/${ENGINE_REV}/linux-arm64-release/linux-arm64-flutter-gtk.zip" \
+            --map "staged_tmp/patch-linux-arm64.zip=shorebird/${ENGINE_REV}/patch-linux-arm64.zip"
+
+      - name: Upload GitHub Actions artifacts
+        if: ${{ steps.check.outputs.skip != 'true' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: loongbird-linux-arm64-host-release-${{ env.ENGINE_REV }}
+          path: staged_artifacts
+          retention-days: 14
+
+      - name: Upload to Loongbird Gateway
+        if: ${{ steps.check.outputs.skip != 'true' && inputs.upload_to_gateway }}
+        env:
+          LOONGBIRD_GATEWAY_URL: ${{ inputs.gateway_url }}
+          LOONGBIRD_API_TOKEN: ${{ secrets.LOONGBIRD_API_TOKEN }}
+        run: |
+          EXTRA_FLAGS=""
+          if [ "${{ inputs.allow_413_fallback }}" = "true" ]; then
+            EXTRA_FLAGS="--allow-413-fallback"
+          fi
+          python3 shorebird/ci/loongbird/upload_artifacts.py \
+            --upload-dir staged_artifacts \
+            $EXTRA_FLAGS
+
+  linux-arm64-host-debug:
+    if: ${{ !inputs.verify_only && (inputs.platforms == 'all' || inputs.platforms == 'arm64' || inputs.platforms == 'linux-arm64') }}
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 150
+    name: '🐧 Linux ARM64 Host Debug Artifacts'
+    steps:
+      - name: Checkout loongbird_flutter
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Check existing artifacts on gateway
+        id: check
+        env:
+          LOONGBIRD_GATEWAY_URL: ${{ inputs.gateway_url }}
+          LOONGBIRD_API_TOKEN: ${{ secrets.LOONGBIRD_API_TOKEN }}
+        run: |
+          ENGINE_REV="$(tr -d '[:space:]' < bin/internal/engine.version)"
+          echo "ENGINE_REV=$ENGINE_REV" >> "$GITHUB_ENV"
+          if [ "${{ inputs.skip_existing_builds }}" = "true" ] && [ -n "$LOONGBIRD_API_TOKEN" ]; then
+            if python3 shorebird/ci/loongbird/upload_artifacts.py \
+              --check-exists "flutter_infra_release/flutter/${ENGINE_REV}/linux-arm64/artifacts.zip"; then
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+              echo "Linux ARM64 host_debug artifact already exists on gateway; skipping build."
+              exit 0
+            fi
+          fi
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+
+      - name: Free runner disk space
+        if: ${{ steps.check.outputs.skip != 'true' }}
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost /usr/local/lib/android /opt/hostedtoolcache/CodeQL
+
+      - name: Install Linux ARM64 build dependencies & Rust target
+        if: ${{ steps.check.outputs.skip != 'true' }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libgtk-3-dev libfreetype6-dev pkg-config ninja-build curl zip unzip build-essential
+          if ! command -v rustup >/dev/null 2>&1; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+            export PATH="$HOME/.cargo/bin:$PATH"
+            echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          fi
+          rustup target add aarch64-unknown-linux-gnu
+
+      - name: Configure git auth & depot_tools
+        if: ${{ steps.check.outputs.skip != 'true' }}
+        env:
+          LOONGBIRD_DART_SDK_TOKEN: ${{ secrets.LOONGBIRD_DART_SDK_TOKEN }}
+        run: |
+          if [ -n "$LOONGBIRD_DART_SDK_TOKEN" ]; then
+            git config --global url."https://x-access-token:${LOONGBIRD_DART_SDK_TOKEN}@github.com/cyjaysong/loongbird_dart_sdk".insteadOf "https://github.com/cyjaysong/loongbird_dart_sdk"
+            git config --global url."https://x-access-token:${LOONGBIRD_DART_SDK_TOKEN}@github.com/CyJaySong/loongbird_dart_sdk".insteadOf "https://github.com/CyJaySong/loongbird_dart_sdk"
+          fi
+          git clone --depth 1 https://chromium.googlesource.com/chromium/tools/depot_tools.git "$HOME/depot_tools"
+          echo "$HOME/depot_tools" >> "$GITHUB_PATH"
+
+      - name: gclient sync (minimal Linux ARM64 host deps)
+        if: ${{ steps.check.outputs.skip != 'true' }}
+        run: |
+          cat > .gclient <<'EOF'
+          solutions = [
+            {
+              "name": ".",
+              "url": "https://github.com/cyjaysong/loongbird_flutter.git",
+              "deps_file": "DEPS",
+              "managed": False,
+              "custom_vars": {
+                "download_android_deps": False,
+                "download_fuchsia_deps": False,
+                "download_emsdk": False,
+                "download_esbuild": False,
+                "download_jdk": False,
+                "download_dart_sdk": False,
+                "setup_githooks": False,
+              },
+            },
+          ]
+          EOF
+          gclient sync --no-history --shallow --delete_unversioned_trees
+
+      - name: Build Linux ARM64 host_debug artifacts
+        if: ${{ steps.check.outputs.skip != 'true' }}
+        run: |
+          python3 shorebird/ci/loongbird/run_gn.py -- --target-os=linux --linux-cpu=arm64
+          ninja -C engine/src/out/linux_debug_arm64 flutter/build/archives:artifacts
+
+      - name: Stage Linux ARM64 host_debug artifacts
+        if: ${{ steps.check.outputs.skip != 'true' }}
+        run: |
+          python3 shorebird/ci/loongbird/upload_artifacts.py \
+            --stage-dir staged_artifacts \
+            --map "engine/src/out/linux_debug_arm64/zip_archives/linux-arm64/artifacts.zip=flutter_infra_release/flutter/${ENGINE_REV}/linux-arm64/artifacts.zip"
+
+      - name: Upload GitHub Actions artifacts
+        if: ${{ steps.check.outputs.skip != 'true' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: loongbird-linux-arm64-host-debug-${{ env.ENGINE_REV }}
+          path: staged_artifacts
+          retention-days: 14
+
+      - name: Upload to Loongbird Gateway
+        if: ${{ steps.check.outputs.skip != 'true' && inputs.upload_to_gateway }}
+        env:
+          LOONGBIRD_GATEWAY_URL: ${{ inputs.gateway_url }}
+          LOONGBIRD_API_TOKEN: ${{ secrets.LOONGBIRD_API_TOKEN }}
+        run: |
+          EXTRA_FLAGS=""
+          if [ "${{ inputs.allow_413_fallback }}" = "true" ]; then
+            EXTRA_FLAGS="--allow-413-fallback"
+          fi
+          python3 shorebird/ci/loongbird/upload_artifacts.py \
+            --upload-dir staged_artifacts \
+            $EXTRA_FLAGS
+
+  # ==========================================================================
+  # WINDOWS ARM64 SHARDS (Cross-compiled on windows-2022, matching upstream)
+  # ==========================================================================
+
+  windows-arm64-host-release:
+    if: ${{ !inputs.verify_only && (inputs.platforms == 'all' || inputs.platforms == 'arm64' || inputs.platforms == 'windows-arm64') }}
+    runs-on: windows-2022
+    timeout-minutes: 240
+    name: '🪟 Windows ARM64 Host Release (Dart SDK + Flutter DLL + patch.exe)'
+    env:
+      DEPOT_TOOLS_WIN_TOOLCHAIN: '0'
+      GYP_MSVS_VERSION: '2022'
+    steps:
+      - name: Enable git longpaths
+        shell: pwsh
+        run: |
+          git config --global core.longpaths true
+          git config --global core.autocrlf false
+
+      - name: Checkout loongbird_flutter
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Check existing artifacts on gateway
+        id: check
+        shell: pwsh
+        env:
+          LOONGBIRD_GATEWAY_URL: ${{ inputs.gateway_url }}
+          LOONGBIRD_API_TOKEN: ${{ secrets.LOONGBIRD_API_TOKEN }}
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $false
+          $engineRev = (Get-Content -Raw bin/internal/engine.version).Trim()
+          "ENGINE_REV=$engineRev" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          if ("${{ inputs.skip_existing_builds }}" -eq "true" -and $env:LOONGBIRD_API_TOKEN) {
+            python shorebird/ci/loongbird/upload_artifacts.py `
+              --check-exists "flutter_infra_release/flutter/$engineRev/dart-sdk-windows-arm64.zip" `
+              --check-exists "flutter_infra_release/flutter/$engineRev/windows-arm64-release/windows-arm64-flutter.zip" `
+              --check-exists "shorebird/$engineRev/patch-windows-arm64.zip"
+            if ($LASTEXITCODE -eq 0) {
+              "skip=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+              Write-Host "All Windows ARM64 host_release artifacts already exist on gateway; skipping build."
+              exit 0
+            }
+          }
+          "skip=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          exit 0
+
+      - name: Free runner disk space
+        if: ${{ steps.check.outputs.skip != 'true' }}
+        shell: pwsh
+        run: |
+          Get-PSDrive -PSProvider FileSystem
+          Remove-Item -Recurse -Force -ErrorAction SilentlyContinue "C:\Android", "C:\ghcup", "C:\hostedtoolcache\windows\CodeQL"
+          Get-PSDrive -PSProvider FileSystem
+
+      - name: Ensure VS2022 ARM64 C++ build tools
+        if: ${{ steps.check.outputs.skip != 'true' }}
+        shell: pwsh
+        run: |
+          $msvcRoot = "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Tools\MSVC"
+          $arm64Cl = Get-ChildItem -Path $msvcRoot -Filter "cl.exe" -Recurse -ErrorAction SilentlyContinue | Where-Object { $_.FullName -like "*\Hostx64\arm64\cl.exe" } | Select-Object -First 1
+          if (-not $arm64Cl) {
+            Write-Host "Installing Visual Studio 2022 ARM64 C++ build tools..."
+            $vsInstaller = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vs_installer.exe"
+            & $vsInstaller modify --installPath "C:\Program Files\Microsoft Visual Studio\2022\Enterprise" `
+              --add Microsoft.VisualStudio.Component.VC.Tools.ARM64 `
+              --add Microsoft.VisualStudio.Component.VC.ATLMFC.ARM64 `
+              --quiet --norestart --wait
+            if ($LASTEXITCODE -ne 0 -and $LASTEXITCODE -ne 3010) {
+              throw "vs_installer failed with exit code $LASTEXITCODE"
+            }
+          } else {
+            Write-Host "Found MSVC ARM64 compiler: $($arm64Cl.FullName)"
+          }
+
+      - name: Configure git auth, Rust ARM64 target & depot_tools
+        if: ${{ steps.check.outputs.skip != 'true' }}
+        shell: pwsh
+        env:
+          LOONGBIRD_DART_SDK_TOKEN: ${{ secrets.LOONGBIRD_DART_SDK_TOKEN }}
+        run: |
+          if ($env:LOONGBIRD_DART_SDK_TOKEN) {
+            git config --global "url.https://x-access-token:$($env:LOONGBIRD_DART_SDK_TOKEN)@github.com/cyjaysong/loongbird_dart_sdk.insteadOf" "https://github.com/cyjaysong/loongbird_dart_sdk"
+            git config --global "url.https://x-access-token:$($env:LOONGBIRD_DART_SDK_TOKEN)@github.com/CyJaySong/loongbird_dart_sdk.insteadOf" "https://github.com/CyJaySong/loongbird_dart_sdk"
+          }
+          rustup target add aarch64-pc-windows-msvc
+          git clone --depth 1 https://chromium.googlesource.com/chromium/tools/depot_tools.git C:\depot_tools
+          "C:\depot_tools" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      - name: gclient sync (minimal Windows host deps)
+        if: ${{ steps.check.outputs.skip != 'true' }}
+        shell: pwsh
+        run: |
+          @'
+          solutions = [
+            {
+              "name": ".",
+              "url": "https://github.com/cyjaysong/loongbird_flutter.git",
+              "deps_file": "DEPS",
+              "managed": False,
+              "custom_vars": {
+                "download_android_deps": False,
+                "download_fuchsia_deps": False,
+                "download_emsdk": False,
+                "download_esbuild": False,
+                "download_jdk": False,
+                "download_dart_sdk": False,
+                "setup_githooks": False,
+              },
+            },
+          ]
+          '@ | Set-Content -Path .gclient -Encoding ascii
+          gclient.bat sync --no-history --shallow --delete_unversioned_trees
+
+      - name: Build Windows ARM64 host_release (dart_sdk + windows_flutter) & patch.exe
+        if: ${{ steps.check.outputs.skip != 'true' }}
+        shell: pwsh
+        run: |
+          Write-Host "Building Windows ARM64 host_release for ENGINE_REV=$env:ENGINE_REV"
+
+          cargo build --release --target aarch64-pc-windows-msvc --manifest-path engine/src/flutter/third_party/updater/patch/Cargo.toml
+
+          python shorebird/ci/loongbird/run_gn.py -- --runtime-mode=release --windows-cpu=arm64
+          ninja -C engine/src/out/host_release_arm64 `
+            dart_sdk `
+            flutter/build/archives:windows_flutter
+
+      - name: Package & stage Windows ARM64 host_release artifacts
+        if: ${{ steps.check.outputs.skip != 'true' }}
+        shell: pwsh
+        run: |
+          python shorebird/ci/loongbird/upload_artifacts.py `
+            --zip-dir "engine/src/out/host_release_arm64/dart-sdk=staged_tmp/dart-sdk-windows-arm64.zip:dart-sdk" `
+            --zip-file "engine/src/flutter/third_party/updater/target/aarch64-pc-windows-msvc/release/patch.exe=staged_tmp/patch-windows-arm64.zip:patch.exe" `
+            --stage-dir staged_artifacts `
+            --map "staged_tmp/dart-sdk-windows-arm64.zip=flutter_infra_release/flutter/$env:ENGINE_REV/dart-sdk-windows-arm64.zip" `
+            --map "engine/src/out/host_release_arm64/zip_archives/windows-arm64-release/windows-arm64-flutter.zip=flutter_infra_release/flutter/$env:ENGINE_REV/windows-arm64-release/windows-arm64-flutter.zip" `
+            --map "staged_tmp/patch-windows-arm64.zip=shorebird/$env:ENGINE_REV/patch-windows-arm64.zip"
+
+      - name: Upload GitHub Actions artifacts
+        if: ${{ steps.check.outputs.skip != 'true' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: loongbird-windows-arm64-host-release-${{ env.ENGINE_REV }}
+          path: staged_artifacts
+          retention-days: 14
+
+      - name: Upload to Loongbird Gateway
+        if: ${{ steps.check.outputs.skip != 'true' && inputs.upload_to_gateway }}
+        shell: pwsh
+        env:
+          LOONGBIRD_GATEWAY_URL: ${{ inputs.gateway_url }}
+          LOONGBIRD_API_TOKEN: ${{ secrets.LOONGBIRD_API_TOKEN }}
+        run: |
+          $extra = @()
+          if ("${{ inputs.allow_413_fallback }}" -eq "true") {
+            $extra += "--allow-413-fallback"
+          }
+          python shorebird/ci/loongbird/upload_artifacts.py --upload-dir staged_artifacts @extra
+
+  windows-arm64-host-debug:
+    if: ${{ !inputs.verify_only && (inputs.platforms == 'all' || inputs.platforms == 'arm64' || inputs.platforms == 'windows-arm64') }}
+    runs-on: windows-2022
+    timeout-minutes: 210
+    name: '🪟 Windows ARM64 Host Debug Artifacts'
+    env:
+      DEPOT_TOOLS_WIN_TOOLCHAIN: '0'
+      GYP_MSVS_VERSION: '2022'
+    steps:
+      - name: Enable git longpaths
+        shell: pwsh
+        run: |
+          git config --global core.longpaths true
+          git config --global core.autocrlf false
+
+      - name: Checkout loongbird_flutter
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Check existing artifacts on gateway
+        id: check
+        shell: pwsh
+        env:
+          LOONGBIRD_GATEWAY_URL: ${{ inputs.gateway_url }}
+          LOONGBIRD_API_TOKEN: ${{ secrets.LOONGBIRD_API_TOKEN }}
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $false
+          $engineRev = (Get-Content -Raw bin/internal/engine.version).Trim()
+          "ENGINE_REV=$engineRev" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          if ("${{ inputs.skip_existing_builds }}" -eq "true" -and $env:LOONGBIRD_API_TOKEN) {
+            python shorebird/ci/loongbird/upload_artifacts.py `
+              --check-exists "flutter_infra_release/flutter/$engineRev/windows-arm64/artifacts.zip"
+            if ($LASTEXITCODE -eq 0) {
+              "skip=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+              Write-Host "Windows ARM64 host_debug artifact already exists on gateway; skipping build."
+              exit 0
+            }
+          }
+          "skip=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          exit 0
+
+      - name: Free runner disk space
+        if: ${{ steps.check.outputs.skip != 'true' }}
+        shell: pwsh
+        run: |
+          Remove-Item -Recurse -Force -ErrorAction SilentlyContinue "C:\Android", "C:\ghcup", "C:\hostedtoolcache\windows\CodeQL"
+
+      - name: Ensure VS2022 ARM64 C++ build tools
+        if: ${{ steps.check.outputs.skip != 'true' }}
+        shell: pwsh
+        run: |
+          $msvcRoot = "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Tools\MSVC"
+          $arm64Cl = Get-ChildItem -Path $msvcRoot -Filter "cl.exe" -Recurse -ErrorAction SilentlyContinue | Where-Object { $_.FullName -like "*\Hostx64\arm64\cl.exe" } | Select-Object -First 1
+          if (-not $arm64Cl) {
+            Write-Host "Installing Visual Studio 2022 ARM64 C++ build tools..."
+            $vsInstaller = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vs_installer.exe"
+            & $vsInstaller modify --installPath "C:\Program Files\Microsoft Visual Studio\2022\Enterprise" `
+              --add Microsoft.VisualStudio.Component.VC.Tools.ARM64 `
+              --add Microsoft.VisualStudio.Component.VC.ATLMFC.ARM64 `
+              --quiet --norestart --wait
+            if ($LASTEXITCODE -ne 0 -and $LASTEXITCODE -ne 3010) {
+              throw "vs_installer failed with exit code $LASTEXITCODE"
+            }
+          } else {
+            Write-Host "Found MSVC ARM64 compiler: $($arm64Cl.FullName)"
+          }
+
+      - name: Configure git auth, Rust ARM64 target & depot_tools
+        if: ${{ steps.check.outputs.skip != 'true' }}
+        shell: pwsh
+        env:
+          LOONGBIRD_DART_SDK_TOKEN: ${{ secrets.LOONGBIRD_DART_SDK_TOKEN }}
+        run: |
+          if ($env:LOONGBIRD_DART_SDK_TOKEN) {
+            git config --global "url.https://x-access-token:$($env:LOONGBIRD_DART_SDK_TOKEN)@github.com/cyjaysong/loongbird_dart_sdk.insteadOf" "https://github.com/cyjaysong/loongbird_dart_sdk"
+            git config --global "url.https://x-access-token:$($env:LOONGBIRD_DART_SDK_TOKEN)@github.com/CyJaySong/loongbird_dart_sdk.insteadOf" "https://github.com/CyJaySong/loongbird_dart_sdk"
+          }
+          rustup target add aarch64-pc-windows-msvc
+          git clone --depth 1 https://chromium.googlesource.com/chromium/tools/depot_tools.git C:\depot_tools
+          "C:\depot_tools" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      - name: gclient sync (minimal Windows host deps)
+        if: ${{ steps.check.outputs.skip != 'true' }}
+        shell: pwsh
+        run: |
+          @'
+          solutions = [
+            {
+              "name": ".",
+              "url": "https://github.com/cyjaysong/loongbird_flutter.git",
+              "deps_file": "DEPS",
+              "managed": False,
+              "custom_vars": {
+                "download_android_deps": False,
+                "download_fuchsia_deps": False,
+                "download_emsdk": False,
+                "download_esbuild": False,
+                "download_jdk": False,
+                "download_dart_sdk": False,
+                "setup_githooks": False,
+              },
+            },
+          ]
+          '@ | Set-Content -Path .gclient -Encoding ascii
+          gclient.bat sync --no-history --shallow --delete_unversioned_trees
+
+      - name: Build Windows ARM64 host_debug artifacts
+        if: ${{ steps.check.outputs.skip != 'true' }}
+        shell: pwsh
+        run: |
+          python shorebird/ci/loongbird/run_gn.py -- --windows-cpu=arm64
+          ninja -C engine/src/out/host_debug_arm64 flutter/build/archives:artifacts
+
+      - name: Stage Windows ARM64 host_debug artifacts
+        if: ${{ steps.check.outputs.skip != 'true' }}
+        shell: pwsh
+        run: |
+          python shorebird/ci/loongbird/upload_artifacts.py `
+            --stage-dir staged_artifacts `
+            --map "engine/src/out/host_debug_arm64/zip_archives/windows-arm64/artifacts.zip=flutter_infra_release/flutter/$env:ENGINE_REV/windows-arm64/artifacts.zip"
+
+      - name: Upload GitHub Actions artifacts
+        if: ${{ steps.check.outputs.skip != 'true' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: loongbird-windows-arm64-host-debug-${{ env.ENGINE_REV }}
+          path: staged_artifacts
+          retention-days: 14
+
+      - name: Upload to Loongbird Gateway
+        if: ${{ steps.check.outputs.skip != 'true' && inputs.upload_to_gateway }}
+        shell: pwsh
+        env:
+          LOONGBIRD_GATEWAY_URL: ${{ inputs.gateway_url }}
+          LOONGBIRD_API_TOKEN: ${{ secrets.LOONGBIRD_API_TOKEN }}
+        run: |
+          $extra = @()
+          if ("${{ inputs.allow_413_fallback }}" -eq "true") {
+            $extra += "--allow-413-fallback"
+          }
+          python shorebird/ci/loongbird/upload_artifacts.py --upload-dir staged_artifacts @extra
+
+  # ==========================================================================
+  # NATIVE ARM64 PURE-ENGINE FUNCTIONAL VERIFICATION
+  # ==========================================================================
+
+  verify-linux-arm64:
+    if: >-
+      ${{
+        !cancelled() &&
+        inputs.run_verify &&
+        (inputs.platforms == 'all' || inputs.platforms == 'arm64' || inputs.platforms == 'linux-arm64') &&
+        (
+          inputs.verify_only ||
+          (
+            needs.linux-arm64-host-release.result == 'success' &&
+            needs.linux-arm64-host-debug.result == 'success'
+          )
+        )
+      }}
+    needs:
+      - linux-arm64-host-release
+      - linux-arm64-host-debug
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 45
+    name: '🧪 Linux ARM64 Pure-Engine Functional Verification'
+    steps:
+      - name: Checkout loongbird_flutter
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Install Linux ARM64 Flutter desktop & Xvfb runtime deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            clang g++ cmake ninja-build pkg-config libgtk-3-dev liblzma-dev \
+            xvfb libgl1-mesa-dri mesa-utils openssl
+
+      - name: Fetch staged Linux ARM64 artifacts from GitHub Actions
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          ENGINE_REV="$(tr -d '[:space:]' < bin/internal/engine.version)"
+          python3 shorebird/ci/loongbird/fetch_gha_artifacts.py \
+            --platform linux \
+            --arch arm64 \
+            --engine-rev "$ENGINE_REV" \
+            --output-dir staged_artifacts
+
+      - name: Run 4-stage Linux ARM64 pure-engine functional verification
+        run: |
+          ENGINE_REV="$(tr -d '[:space:]' < bin/internal/engine.version)"
+          python3 shorebird/ci/loongbird/verify_engine.py \
+            --platform linux \
+            --arch arm64 \
+            --artifacts-dir staged_artifacts \
+            --flutter-root "$PWD" \
+            --engine-rev "$ENGINE_REV"
+
+  verify-windows-arm64:
+    if: >-
+      ${{
+        !cancelled() &&
+        inputs.run_verify &&
+        (inputs.platforms == 'all' || inputs.platforms == 'arm64' || inputs.platforms == 'windows-arm64') &&
+        (
+          inputs.verify_only ||
+          (
+            needs.windows-arm64-host-release.result == 'success' &&
+            needs.windows-arm64-host-debug.result == 'success'
+          )
+        )
+      }}
+    needs:
+      - windows-arm64-host-release
+      - windows-arm64-host-debug
+    runs-on: windows-11-arm
+    timeout-minutes: 45
+    name: '🧪 Windows ARM64 Pure-Engine Functional Verification'
+    steps:
+      - name: Enable git longpaths
+        shell: pwsh
+        run: |
+          git config --system core.longpaths true
+          git config --global core.longpaths true
+          git config --global core.autocrlf false
+
+      - name: Checkout loongbird_flutter
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Fetch staged Windows ARM64 artifacts from GitHub Actions
+        shell: pwsh
+        env:
+          PYTHONUTF8: '1'
+          PYTHONIOENCODING: 'utf-8:replace'
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $engineRev = (Get-Content -Raw bin/internal/engine.version).Trim()
+          python shorebird/ci/loongbird/fetch_gha_artifacts.py `
+            --platform windows `
+            --arch arm64 `
+            --engine-rev "$engineRev" `
+            --output-dir staged_artifacts
+
+      - name: Run 4-stage Windows ARM64 pure-engine functional verification
+        shell: pwsh
+        env:
+          PYTHONUTF8: '1'
+          PYTHONIOENCODING: 'utf-8:replace'
+        run: |
+          $engineRev = (Get-Content -Raw bin/internal/engine.version).Trim()
+          python shorebird/ci/loongbird/verify_engine.py `
+            --platform windows `
+            --arch arm64 `
             --artifacts-dir staged_artifacts `
             --flutter-root "$PWD" `
             --engine-rev "$engineRev"

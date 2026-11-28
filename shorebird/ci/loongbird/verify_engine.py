@@ -780,10 +780,10 @@ class MockUpdaterServer:
 
 
 def verify_stage1_dart_sdk(
-    artifacts_dir: Path, engine_rev: str, platform: str, work: Path
+    artifacts_dir: Path, engine_rev: str, platform: str, work: Path, arch: str = "x64"
 ) -> Path:
-    _safe_print("\n=== STAGE 1: Dart SDK Functional Verification ===\n")
-    sdk_zip = artifacts_dir / f"flutter_infra_release/flutter/{engine_rev}/dart-sdk-{platform}-x64.zip"
+    _safe_print(f"\n=== STAGE 1: Dart SDK ({platform}-{arch}) Functional Verification ===\n")
+    sdk_zip = artifacts_dir / f"flutter_infra_release/flutter/{engine_rev}/dart-sdk-{platform}-{arch}.zip"
     if not sdk_zip.is_file():
         raise RuntimeError(f"Missing Dart SDK zip: {sdk_zip}")
 
@@ -845,13 +845,22 @@ def verify_stage1_dart_sdk(
 
 
 def verify_stage2_tools_and_android_gen_snapshot(
-    artifacts_dir: Path, engine_rev: str, platform: str, work: Path, sdk_dir: Path
+    artifacts_dir: Path,
+    engine_rev: str,
+    platform: str,
+    work: Path,
+    sdk_dir: Path,
+    arch: str = "x64",
 ) -> None:
-    _safe_print("\n=== STAGE 2: Host Debug Tools & Android 3-ABI gen_snapshot Verification ===\n")
+    _safe_print(
+        f"\n=== STAGE 2: Host Debug Tools ({platform}-{arch})"
+        + (" & Android 3-ABI gen_snapshot" if arch == "x64" else " & Host AOT gen_snapshot")
+        + " Verification ===\n"
+    )
     exe = ".exe" if platform == "windows" else ""
 
     # 2a. Host debug artifacts.zip
-    host_dbg_zip = artifacts_dir / f"flutter_infra_release/flutter/{engine_rev}/{platform}-x64/artifacts.zip"
+    host_dbg_zip = artifacts_dir / f"flutter_infra_release/flutter/{engine_rev}/{platform}-{arch}/artifacts.zip"
     if not host_dbg_zip.is_file():
         raise RuntimeError(f"Missing host debug zip: {host_dbg_zip}")
     host_dbg_dir = work / "stage2_host_debug"
@@ -879,7 +888,35 @@ def verify_stage2_tools_and_android_gen_snapshot(
         ]
     )
     if not dill_path.is_file() or dill_path.stat().st_size == 0:
-        raise RuntimeError("Failed to compile AOT kernel .dill for Android gen_snapshot check")
+        raise RuntimeError("Failed to compile AOT kernel .dill for gen_snapshot check")
+
+    if arch != "x64":
+        # Upstream Flutter does not ship Android cross-arch gen_snapshot binaries
+        # for Linux/Windows ARM64 hosts. Verify the native ARM64 host gen_snapshot
+        # emits a valid AArch64 ELF snapshot (`EM_AARCH64=183`).
+        elf_out = work / f"stage2_host_{arch}.so"
+        run_cmd(
+            [
+                str(host_dbg_dir / f"gen_snapshot{exe}"),
+                "--deterministic",
+                "--snapshot_kind=app-aot-elf",
+                f"--elf={elf_out}",
+                str(dill_path),
+            ]
+        )
+        hdr = elf_out.read_bytes()[:20]
+        if len(hdr) < 20 or hdr[:4] != b"\x7fELF":
+            raise RuntimeError(f"Host {platform}-{arch} output is not a valid ELF file: {elf_out}")
+        e_machine = struct.unpack("<H", hdr[18:20])[0]
+        if e_machine != 183:
+            raise RuntimeError(
+                f"Host {platform}-{arch} ELF e_machine mismatch: expected 183 (EM_AARCH64), got {e_machine}"
+            )
+        _safe_print(
+            f"[stage2] PASS: Host {platform}-{arch} debug tools & AArch64 AOT ELF "
+            f"({elf_out.stat().st_size} B, e_machine=183)\n"
+        )
+        return
 
     # 2c. Verify all 3 Android cross-arch gen_snapshots produce valid ELF with exact e_machine
     expected_machines = {
@@ -929,11 +966,11 @@ def verify_stage2_tools_and_android_gen_snapshot(
 
 
 def verify_stage3_patch_cli(
-    artifacts_dir: Path, engine_rev: str, platform: str, work: Path
+    artifacts_dir: Path, engine_rev: str, platform: str, work: Path, arch: str = "x64"
 ) -> Path:
-    _safe_print("\n=== STAGE 3: Rust `patch` Binary Diff Tool Verification ===\n")
+    _safe_print(f"\n=== STAGE 3: Rust `patch` ({platform}-{arch}) Binary Diff Tool Verification ===\n")
     exe = ".exe" if platform == "windows" else ""
-    patch_zip = artifacts_dir / f"shorebird/{engine_rev}/patch-{platform}-x64.zip"
+    patch_zip = artifacts_dir / f"shorebird/{engine_rev}/patch-{platform}-{arch}.zip"
     if not patch_zip.is_file():
         raise RuntimeError(f"Missing patch CLI zip: {patch_zip}")
 
@@ -1034,8 +1071,9 @@ def verify_stage4_desktop_hot_update(
     platform: str,
     work: Path,
     patch_bin: Path,
+    arch: str = "x64",
 ) -> None:
-    _safe_print("\n=== STAGE 4: Full Desktop Release Build + 3-Run RSA-2048 Strict Hot-Update ===\n")
+    _safe_print(f"\n=== STAGE 4: Full Desktop ({platform}-{arch}) Release Build + 5-Run RSA-2048 Strict Hot-Update ===\n")
 
     ensure_flutter_release_ref(flutter_root)
 
@@ -1074,7 +1112,7 @@ def verify_stage4_desktop_hot_update(
             raise RuntimeError(f"Expected bin/cache/engine.stamp={engine_rev}, got '{stamp}'")
         _safe_print(f"[stage4] bin/cache/engine.stamp verified: {stamp}\n")
 
-        dart_sdk_rel = f"flutter_infra_release/flutter/{engine_rev}/dart-sdk-{platform}-x64.zip"
+        dart_sdk_rel = f"flutter_infra_release/flutter/{engine_rev}/dart-sdk-{platform}-{arch}.zip"
         if proxy.local_hits.get(dart_sdk_rel, 0) < 1:
             raise RuntimeError(f"Flutter did NOT fetch local Dart SDK {dart_sdk_rel} from proxy!")
 
@@ -1147,11 +1185,11 @@ def verify_stage4_desktop_hot_update(
 
         # Confirm our freshly built desktop release engine zip was fetched from the local proxy!
         if platform == "linux":
-            rel_engine_key = f"flutter_infra_release/flutter/{engine_rev}/linux-x64-release/linux-x64-flutter-gtk.zip"
-            bundle_src = app_dir / "build" / "linux" / "x64" / "release" / "bundle"
+            rel_engine_key = f"flutter_infra_release/flutter/{engine_rev}/linux-{arch}-release/linux-{arch}-flutter-gtk.zip"
+            bundle_src = app_dir / "build" / "linux" / arch / "release" / "bundle"
         else:
-            rel_engine_key = f"flutter_infra_release/flutter/{engine_rev}/windows-x64-release/windows-x64-flutter.zip"
-            bundle_src = app_dir / "build" / "windows" / "x64" / "runner" / "Release"
+            rel_engine_key = f"flutter_infra_release/flutter/{engine_rev}/windows-{arch}-release/windows-{arch}-flutter.zip"
+            bundle_src = app_dir / "build" / "windows" / arch / "runner" / "Release"
 
         if proxy.local_hits.get(rel_engine_key, 0) < 1:
             raise RuntimeError(
@@ -1321,13 +1359,20 @@ def verify_stage4_desktop_hot_update(
         if mock.download_count < 1:
             raise RuntimeError("Mock updater server never served /patches/1.bin")
         first_req = mock.check_requests[0]
-        if first_req.get("app_id") != app_id or first_req.get("platform") != platform:
-            raise RuntimeError(f"Unexpected patch check payload: {first_req}")
+        expected_rust_arch = "aarch64" if arch == "arm64" else "x86_64"
+        if (
+            first_req.get("app_id") != app_id
+            or first_req.get("platform") != platform
+            or first_req.get("arch") != expected_rust_arch
+        ):
+            raise RuntimeError(
+                f"Unexpected patch check payload (expected arch={expected_rust_arch}): {first_req}"
+            )
         if first_req.get("release_version") != "1.0.0+1":
             raise RuntimeError(f"Unexpected release_version: {first_req}")
 
         _safe_print(
-            f"[stage4] PASS: 3-run {platform} desktop RSA-2048 strict hot-update verified! "
+            f"[stage4] PASS: 5-run {platform}-{arch} desktop RSA-2048 strict hot-update verified! "
             f"(checks={len(mock.check_requests)}, downloads={mock.download_count}, "
             f"events={len(mock.events)}, local_proxy_hits={proxy.local_hits})\n"
         )
@@ -1343,6 +1388,7 @@ def main(argv: list[str]) -> int:
         description="Pure-engine functional verification for Loongbird Linux & Windows artifacts."
     )
     parser.add_argument("--platform", required=True, choices=["linux", "windows"])
+    parser.add_argument("--arch", default="x64", choices=["x64", "arm64"])
     parser.add_argument("--artifacts-dir", required=True)
     parser.add_argument(
         "--flutter-root",
@@ -1374,18 +1420,18 @@ def main(argv: list[str]) -> int:
         cleanup_work = True
 
     _safe_print(
-        f"[verify] platform={args.platform} engine_rev={engine_rev}\n"
+        f"[verify] platform={args.platform} arch={args.arch} engine_rev={engine_rev}\n"
         f"[verify] flutter_root={flutter_root}\n"
         f"[verify] artifacts_dir={artifacts_dir}\n"
         f"[verify] workdir={work}\n"
     )
 
     try:
-        sdk_dir = verify_stage1_dart_sdk(artifacts_dir, engine_rev, args.platform, work)
+        sdk_dir = verify_stage1_dart_sdk(artifacts_dir, engine_rev, args.platform, work, arch=args.arch)
         verify_stage2_tools_and_android_gen_snapshot(
-            artifacts_dir, engine_rev, args.platform, work, sdk_dir
+            artifacts_dir, engine_rev, args.platform, work, sdk_dir, arch=args.arch
         )
-        patch_bin = verify_stage3_patch_cli(artifacts_dir, engine_rev, args.platform, work)
+        patch_bin = verify_stage3_patch_cli(artifacts_dir, engine_rev, args.platform, work, arch=args.arch)
         verify_stage4_desktop_hot_update(
             flutter_root=flutter_root,
             artifacts_dir=artifacts_dir,
@@ -1395,9 +1441,10 @@ def main(argv: list[str]) -> int:
             platform=args.platform,
             work=work,
             patch_bin=patch_bin,
+            arch=args.arch,
         )
         _safe_print(
-            f"\n[verify] ALL 4 STAGES PASSED for {args.platform} (engine={engine_rev})!\n"
+            f"\n[verify] ALL 4 STAGES PASSED for {args.platform}-{args.arch} (engine={engine_rev})!\n"
         )
         return 0
     finally:
