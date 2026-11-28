@@ -133,11 +133,17 @@ def _configure_msvc_env(env, rust_target):
   full of __imp_* references that the engine's /MT link cannot resolve
   (e.g. __imp_clock, __imp__wassert, __imp_qsort_s).
 
-  Force /MT via the per-target CFLAGS env that the cc crate honors. cc
-  appends these flags at the end of its command line, so cl.exe sees
-  `/MD ... /MT` and emits warning D9025 ("overriding '/MD' with '/MT'")
-  and uses the last one -- /MT wins.
+  On aarch64-pc-windows-msvc, ring@0.17 invokes the GNU-style `clang` driver
+  for its C/assembly sources, which rejects MSVC `/MT` in CFLAGS as a file
+  path (`clang: error: no such file or directory: '/MT'`). Use MSVC's `_CL_`
+  env var instead: `cl.exe` appends `_CL_` to the end of its command line
+  (so `/MT` overrides `/MD`), while `clang` ignores `_CL_` completely.
   """
+  if rust_target.startswith('aarch64-'):
+    existing = env.get('_CL_', '').strip()
+    env['_CL_'] = f'{existing} /MT'.strip() if existing else '/MT'
+    return
+
   triple_env = rust_target.replace('-', '_')
   env[f'CFLAGS_{triple_env}'] = '/MT'
   env[f'CXXFLAGS_{triple_env}'] = '/MT'
