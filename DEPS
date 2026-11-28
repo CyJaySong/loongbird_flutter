@@ -645,7 +645,8 @@ deps = {
         'version': 'version:21'
        }
      ],
-     # Always download the JDK since java is required for running the formatter.
+     # Honor download_jdk so hosts without a CIPD OpenJDK package (e.g. linux-arm64) can sync cleanly.
+     'condition': 'download_jdk',
      'dep_type': 'cipd',
    },
 
